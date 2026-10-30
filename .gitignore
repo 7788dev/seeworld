@@ -1,0 +1,8 @@
+.codeartsdoer/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+node_modules/
+__pycache__/
+*.log
