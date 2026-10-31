@@ -24,6 +24,7 @@ fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .use_native_tls()
             .user_agent(UA)
             .timeout(TIMEOUT)
             .connect_timeout(Duration::from_secs(5))
