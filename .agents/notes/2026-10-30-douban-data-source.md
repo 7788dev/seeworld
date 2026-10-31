@@ -1,34 +1,34 @@
-# 决策：豆瓣影视数据源接入（列表/搜索/详情/海报）
+# 决策：豆瓣数据与多源播放接入
 
-日期：2026-10-30 · 状态：已实施
+日期：2026-10-30 · 更新：2026-10-31 · 状态：已实施
 
 ## 背景
 
-需求：接入真实影视封皮（海报）、详情数据、搜索，暂不接播放源。项目原为 Netflix 风格硬编码演示数据（9 部）。
+最初为硬编码演示数据的 Netflix 风格原型。目标是把「发现 → 详情 → 播放」做成真实链路：豆瓣负责元数据，播放源负责可播放地址，并保证失败时明确报错而不是回退演示数据。
 
-## 方案（参考 LunaTV/MoonTV 的成熟做法并实测）
+## 数据链路
 
-数据链路：前端 `douban.ts`（invoke 封装 + Title 适配器）→ Rust `douban.rs`（reqwest 多 host 回退 + 内存缓存）。
+前端 `douban.ts`（类型 + invoke 封装 + Title 适配器）→ Rust `douban.rs`。
 
-- **列表**：`GET /j/search_subjects?type={tv|movie}&tag={热门|最新|…}&sort=recommend&page_limit&page_start`
-- **搜索**：`GET /j/subject_suggest?q={UTF-8 编码}`
-- **详情**：`GET m.douban.com/rexxar/api/v2/{movie|tv}/{id}`（kind 双端点回退；返回 rating/genres/directors/actors/intro/pic/durations/episodes_count）
-- **Host 回退顺序**：`*.cmliussss.net`（腾讯反代）→ `.com`（阿里）→ 官方域名（先 GET 首页拿 bid cookie 再请求）
-- **图片防盗链**：Tauri 自定义协议 `dbimg://<原URL>`，Rust 端带 `Referer: https://movie.douban.com/explore` + 浏览器 UA 转发（LunaTV image-proxy 的桌面等价物）。hero 大图用 `s_ratio_poster→l_ratio_poster` 替换。
-- **缓存**：Rust 内存缓存（列表/搜索 10min、详情 24h）；前端 localStorage `jj-title-cache` 持久化片库注册表。
-- **降级**：豆瓣不可用时回退内置演示片库，UI 提示 + 重试按钮。
+- 列表/搜索/详情优先官方域名，失败回退 `*.cmliussss.net` 反代。
+- 图片统一经 `dbimg://` 代理并带 Referer；卡片用 `m_ratio_poster`，hero/详情用 `l_ratio_poster`。
+- 缓存：Rust 内存缓存（列表/搜索 10 分钟、详情 24 小时）；前端 `jj-feed-cache`（5 分钟 TTL，首页启动刷新）。
+- 拉取失败显示错误与重试；不再内置演示片库。
 
-## Alternatives considered
+## 播放链路
 
-1. **frodo 移动端 API**（frodo.douban.com/api/v2）：需 apiKey+签名，公开 key 已失效（实测 invalid_apikey），弃用。
-2. **详情页 HTML 解析（JSON-LD/top250 正则）**：被 `sec.douban.com` 风控 302 挡住（实测），且解析脆弱，弃用（LunaTV 的 top250 走 HTML 正则是因为该页无 JSON API）。
-3. **官方域名直连**：列表接口需 bid cookie（实测无 cookie 返回空/错误），仅作兜底路径。
-4. **前端直接 fetch 豆瓣**：CORS + Referer 双重拦截，不可行，必须走 Rust 代理。
-5. **图片 referrerPolicy=no-referrer**：实测豆瓣图床对无 Referer 请求返回 418，不可行。
+- 7 个影视 CMS 源 + AniCh 动漫聚合，注册在 `src-tauri/resources/play-sources.json`，可用 `%APPDATA%/com.jianjie.desktop/play-sources.json` 覆盖。
+- 搜索全源并发聚合；详情与线路并发探测，按速度/稳定性/质量评分，MP4 直链与 H.264 优先。
+- HLS/MP4 经 `jjstream` 代理；按线路过滤广告（时长指纹、关键词、短分片），MP4 大文件按 16MB Range 分段回源。
+- 动漫优先 AniCh；弹幕按集聚合 AniCh 与 B 站弹幕，Canvas 渲染。
+- 自动换源仅三种触发：启动无帧、单次冻结 60 秒、5 分钟内 ≥3 次真实卡顿。
 
-## 遗留 / 下一步
+## 备选与取舍
 
-- 播放源接入（Theater 仍为模拟播放；豆瓣 episodes 是生成的占位列表）。
-- 豆瓣 tag 体系可扩展（华语/欧美/经典等，见 `DOUBAN_FEEDS`）。
-- top250 榜单（可参考 LunaTV 的 HTML 正则方案，官方无 JSON API）。
-- localStorage 注册表超 5MB 的裁剪策略目前是粗暴 slice(-300)，可优化为 LRU。
+- frodo 移动端 API 需要已失效的公开 key；详情页 HTML 解析被风控；前端直连豆瓣受 CORS/Referer 拦截；图片无 Referer 返回 418。以上方案均弃用。
+
+## 遗留
+
+- top250 无官方 JSON API。
+- 片库注册表超过 localStorage 配额时的裁剪策略仍可细化。
+- AniCh 上游协议变动需同步手写 protobuf 解码与 UA。

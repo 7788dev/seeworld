@@ -4,5 +4,10 @@
 .DS_Store
 Thumbs.db
 node_modules/
+dist/
+vibe_images/checks/
 __pycache__/
 *.log
+release/
+.qoder-collab-runtime/
+src-tauri/target/

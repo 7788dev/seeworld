@@ -75,7 +75,7 @@ export default function TitleCard({
 
       <div className="card-copy">
         <div className="card-brand">
-          <span className="n-mark">N</span>
+          <span className="n-mark">S</span>
           <span>{mediaLabel(title.mediaType, language)}</span>
         </div>
         <h3 className={titleClass}>

@@ -81,7 +81,7 @@ export default function Hero({
 
         <div className="hero-copy">
           <div className="hero-brand">
-            <span className="n-mark">N</span>
+            <span className="n-mark">S</span>
             <span>{mediaLabel(featured.mediaType, language)}</span>
           </div>
 
