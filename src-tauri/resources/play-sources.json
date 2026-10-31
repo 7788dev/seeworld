@@ -1,0 +1,157 @@
+{
+  "_comment": "播放源配置。active: dyttzy/ffzy(核心直连源)+ lzi/bfzy/jyzy/piaoling2(备用池,扩大自动换源候选;lzi/bfzy 的 ppvod/adjump 广告由 adFilter=safe 内置过滤)。jszy 保持禁用(封皮与资源错配,错片硬伤)。用户可用 %APPDATA%/com.jianjie.desktop/play-sources.json 覆盖(replace=true)。",
+  "version": 2,
+  "sources": [
+    {
+      "key": "dyttzy",
+      "name": "电影天堂",
+      "type": "cms",
+      "api": "https://caiji.dyttzyapi.com/api.php/provide/vod/",
+      "enabled": true,
+      "priority": 90,
+      "adFilter": "safe",
+      "adRules": {
+        "dropShortBlocks": false,
+        "shortBlockSeconds": 8.0,
+        "adDurationFingerprints": [
+          [
+            5.567,
+            2.933,
+            5.7,
+            3.333,
+            1.533
+          ]
+        ],
+        "adDurationTolerance": 0.15,
+        "dropUniqueHostBlocks": false,
+        "maxAdBlockSeconds": 60.0,
+        "maxDropRatio": 0.05
+      }
+    },
+    {
+      "key": "ffzy",
+      "name": "非凡资源",
+      "type": "cms",
+      "api": "https://cj.ffzyapi.com/api.php/provide/vod/",
+      "enabled": true,
+      "priority": 85,
+      "adFilter": "safe",
+      "adRules": {
+        "dropShortBlocks": false,
+        "shortBlockSeconds": 8.0,
+        "adDurationFingerprints": [
+          [
+            4.867,
+            3.333,
+            6.367,
+            2.1,
+            2.967,
+            3.879
+          ]
+        ],
+        "adDurationTolerance": 0.15,
+        "dropUniqueHostBlocks": false,
+        "maxAdBlockSeconds": 60.0,
+        "maxDropRatio": 0.05
+      }
+    },
+    {
+      "key": "lzi",
+      "name": "量子资源",
+      "type": "cms",
+      "api": "https://cj.lziapi.com/api.php/provide/vod/",
+      "enabled": true,
+      "priority": 80,
+      "alwaysProxy": true,
+      "adFilter": "safe",
+      "note": "备用池:ppvod 广告由 safe 过滤处理;画质 1080x608 略低,仅在核心源失败时作为换源候选",
+      "adRules": {
+        "dropShortBlocks": false,
+        "shortBlockSeconds": 8.0,
+        "adDurationFingerprints": [],
+        "adDurationTolerance": 0.15,
+        "dropUniqueHostBlocks": true,
+        "maxAdBlockSeconds": 60.0,
+        "maxDropRatio": 0.05
+      }
+    },
+    {
+      "key": "bfzy",
+      "name": "暴风资源",
+      "type": "cms",
+      "api": "https://bfzyapi.com/api.php/provide/vod/",
+      "enabled": true,
+      "priority": 75,
+      "alwaysProxy": true,
+      "adFilter": "safe",
+      "note": "备用池:adjump 广告由 safe 过滤处理",
+      "adRules": {
+        "dropShortBlocks": false,
+        "shortBlockSeconds": 8.0,
+        "adDurationFingerprints": [],
+        "adDurationTolerance": 0.15,
+        "dropUniqueHostBlocks": false,
+        "maxAdBlockSeconds": 60.0,
+        "maxDropRatio": 0.05
+      }
+    },
+    {
+      "key": "jyzy",
+      "name": "金鹰资源",
+      "type": "cms",
+      "api": "https://jyzyapi.com/api.php/provide/vod/",
+      "enabled": true,
+      "priority": 65,
+      "adFilter": "safe",
+      "note": "备用池:历史稳定性 14/19,频繁缓冲时会被自动换源规则自然规避",
+      "adRules": {
+        "dropShortBlocks": false,
+        "shortBlockSeconds": 8.0,
+        "adDurationFingerprints": [],
+        "adDurationTolerance": 0.15,
+        "dropUniqueHostBlocks": false,
+        "maxAdBlockSeconds": 60.0,
+        "maxDropRatio": 0.05
+      }
+    },
+    {
+      "key": "piaoling2",
+      "name": "飘零资源",
+      "type": "cms",
+      "api": "https://p2100.net/api.php/provide/vod/",
+      "enabled": true,
+      "priority": 60,
+      "adFilter": "safe",
+      "note": "备用池:720P 备选",
+      "adRules": {
+        "dropShortBlocks": false,
+        "shortBlockSeconds": 8.0,
+        "adDurationFingerprints": [],
+        "adDurationTolerance": 0.15,
+        "dropUniqueHostBlocks": false,
+        "maxAdBlockSeconds": 60.0,
+        "maxDropRatio": 0.05
+      }
+    },
+    {
+      "key": "jszy",
+      "name": "极速资源",
+      "type": "cms",
+      "api": "https://jszyapi.com/api.php/provide/vod/",
+      "enabled": false,
+      "priority": 10,
+      "alwaysProxy": true,
+      "adFilter": "safe",
+      "note": "保持禁用:封皮与资源不匹配(错片风险),不再参与",
+      "adRules": {
+        "dropShortBlocks": false,
+        "shortBlockSeconds": 8.0,
+        "adDurationFingerprints": [],
+        "adDurationTolerance": 0.15,
+        "dropUniqueHostBlocks": false,
+        "maxAdBlockSeconds": 60.0,
+        "maxDropRatio": 0.05
+      }
+    }
+  ]
+}

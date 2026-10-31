@@ -1,0 +1,48 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Jianjie",
+  "version": "0.1.0",
+  "identifier": "com.jianjie.desktop",
+  "build": {
+    "frontendDist": "../prototype/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm --prefix prototype run dev -- --port 1420 --strictPort",
+    "beforeBuildCommand": "npm --prefix prototype run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "见界 · 私人影院",
+        "width": 1292,
+        "height": 864,
+        "minWidth": 1000,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true,
+        "maximized": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "fullscreen": false,
+        "theme": "Dark",
+        "backgroundColor": "#00000000"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "见界 · 私人影院",
+    "longDescription": "见界是一间只属于你的私人影院。"
+  }
+}

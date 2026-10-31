@@ -1,0 +1,15 @@
+{
+  "name": "jianjie-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "见界 · Windows 桌面私人影院",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:exe": "tauri build --no-bundle",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4"
+  }
+}
