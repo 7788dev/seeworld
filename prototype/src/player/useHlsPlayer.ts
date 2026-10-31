@@ -581,15 +581,13 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
             `[jj] play hls level ${data.level} frags=${fragments} dur=${total.toFixed(1)} live=${details.live} endList=${endList}`,
           )
           if (details.live) return
-          // F-01 signal: VOD playlists that end far too early or with too few segments.
-          const truncated =
-            (expected > 60 && total > 0 && total < expected * 0.5) ||
-            (total > 0 && total < 60) ||
-            (total >= 600 && fragments < 30)
+          // 只对“已知电影时长”的明显截断做失败判定；剧集每集时长不同，
+          // 短片段/短剧也不能仅凭绝对时长误杀。
+          const truncated = expected > 120 && total > 0 && total < expected * 0.5
           if (truncated) {
             fail(
               'load-failed',
-              `manifest truncated: frags=${fragments}, dur=${total.toFixed(1)}s, expected=${expected > 0 ? expected.toFixed(1) : 'n/a'}s`,
+              `manifest truncated: frags=${fragments}, dur=${total.toFixed(1)}s, expected=${expected.toFixed(1)}s`,
             )
           }
         })

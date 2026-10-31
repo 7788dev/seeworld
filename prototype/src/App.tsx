@@ -1,12 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, Check, ChevronRight, Menu, Settings } from 'lucide-react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowLeft, ArrowUp, Check, ChevronRight, Menu, Settings } from 'lucide-react'
 import BrowseView from './components/BrowseView'
 import DetailModal from './components/DetailModal'
 import HomeView from './components/HomeView'
 import RoomSwitch from './components/RoomSwitch'
 import SearchView from './components/SearchView'
 import Sidebar from './components/Sidebar'
-import Theater from './components/Theater'
 import TitleBar from './components/TitleBar'
 import { initialEpisodeFor, titleName } from './content'
 import type { Episode, Title, ViewKey } from './data'
@@ -18,6 +17,8 @@ import {
   fetchDoubanDetail,
   fetchDoubanList,
   fetchDoubanSuggest,
+  placeholderEpisodes,
+  sourcePoster,
   subjectToTitle,
   suggestToTitle,
 } from './douban'
@@ -27,26 +28,29 @@ import { cx, isDesktopApp, stripHtml, usePersistentState } from './lib'
 import {
   episodeIdForIndex,
   episodeNumberOf,
-  writeMatch,
+  aggregateSourceLines,
   errorInfoOf,
   isPlayableEpisode,
   isPlayableLine,
-  isAnimeTitle,
   matchTitleName,
   nextPlayableEpisodeIndex,
   playableEpisodeIndex,
+  playDetail,
   playProbe,
   playResolve,
   playSearch,
   playSources,
   readMatch,
   resolveSession,
+  sourceTypeIsSeries,
 } from './play'
 import type {
+  AggregateLine,
   PlayDetail,
   PlaySearchItem,
   PlayErrorInfo,
   PlayProbeResult,
+  PlaySourceInfo,
   PlayTarget,
   ResolvedSession,
 } from './play'
@@ -55,61 +59,258 @@ import type { PlaybackProgress, PlaybackState, PlaybackStatus } from './types'
 const TITLE_CACHE_KEY = 'jj-title-cache'
 const FEED_CACHE_KEY = 'jj-feed-cache'
 const FEED_TTL = 5 * 60 * 1000
+const TITLE_CACHE_BUDGET = 2_000_000
+const FEED_EMPTY_ROUNDS_LIMIT = 3
+
+const Theater = lazy(() => import('./components/Theater'))
 
 interface CachedFeed {
   ids: string[]
   updatedAt: number
+  offsets?: number[]
+  exhausted?: boolean
 }
 
 const readFeedCache = (): Record<string, CachedFeed> => {
   try {
     const stored = localStorage.getItem(FEED_CACHE_KEY)
-    return stored ? (JSON.parse(stored) as Record<string, CachedFeed>) : {}
+    if (!stored) return {}
+    const parsed: unknown = JSON.parse(stored)
+    if (!parsed || typeof parsed !== 'object') return {}
+    const result: Record<string, CachedFeed> = {}
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object') continue
+      const entry = value as Partial<CachedFeed>
+      if (!Array.isArray(entry.ids)) continue
+      const ids = entry.ids.filter((id): id is string => typeof id === 'string')
+      if (ids.length === 0) continue
+      const offsets =
+        Array.isArray(entry.offsets) &&
+        entry.offsets.length > 0 &&
+        entry.offsets.every((offset) => typeof offset === 'number' && Number.isFinite(offset))
+          ? entry.offsets
+          : undefined
+      result[key] = {
+        ids,
+        // 旧缓存没有 offsets，视为过期，强制刷新一次后才能继续翻页。
+        updatedAt:
+          offsets && typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt)
+            ? entry.updatedAt
+            : 0,
+        offsets,
+        exhausted: entry.exhausted === true,
+      }
+    }
+    return result
   } catch {
     return {}
   }
 }
 
 const cachedFeeds = readFeedCache()
-const cachedFeedTimes = Object.fromEntries(
-  Object.entries(cachedFeeds).map(([key, entry]) => [key, entry.updatedAt ?? 0]),
-) as Record<string, number>
 
-const initialFeedState = (): Record<string, FeedState> => {
-  const state: Record<string, FeedState> = {}
-  for (const [key, entry] of Object.entries(cachedFeeds)) {
-    if (entry.ids?.length > 0) {
-      state[key] = { ids: entry.ids, loading: false, error: false }
-    }
-  }
-  state.home ??= { ids: [], loading: true, error: false }
-  return state
-}
+const sanitizeString = (value: unknown) => (typeof value === 'string' ? value : '')
+const sanitizeNumber = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+const sanitizeStrings = (value: unknown) =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 
-const migrateCachedTitle = (title: Title): Title => {
-  if (!title.id.startsWith('db-')) return title
-  const poster = dbCardImg(title.poster ?? '')
-  const hero = dbHeroImg(title.hero || title.poster || '')
-  if (poster === title.poster && hero === title.hero && title.ageRating === '') {
-    return title
+const migrateCachedTitle = (value: unknown): Title | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const id = sanitizeString(raw.id)
+  const name = sanitizeString(raw.name)
+  if (!id || !name) return null
+  const mediaType = raw.mediaType === 'series' ? 'series' : 'film'
+  const episodesCount =
+    typeof raw.episodesCount === 'number' && Number.isFinite(raw.episodesCount) && raw.episodesCount > 0
+      ? raw.episodesCount
+      : undefined
+  const episodes = (Array.isArray(raw.episodes) ? raw.episodes : [])
+    .map((value): Episode | null => {
+      if (!value || typeof value !== 'object') return null
+      const episode = value as Record<string, unknown>
+      if (typeof episode.id !== 'string' || typeof episode.number !== 'number') return null
+      return {
+        id: episode.id,
+        season: typeof episode.season === 'number' ? episode.season : 1,
+        number: episode.number,
+        name:
+          typeof episode.name === 'string' && episode.name
+            ? episode.name
+            : `E${episode.number}`,
+        runtime: typeof episode.runtime === 'string' ? episode.runtime : '',
+        synopsis: typeof episode.synopsis === 'string' ? episode.synopsis : '',
+      }
+    })
+    .filter((episode): episode is Episode => Boolean(episode))
+  let poster = sanitizeString(raw.poster)
+  let hero = sanitizeString(raw.hero) || poster
+  if (id.startsWith('db-')) {
+    poster = dbCardImg(poster)
+    hero = dbHeroImg(hero)
   }
-  return { ...title, poster, hero, ageRating: '' }
+  return {
+    id,
+    name,
+    mediaType,
+    year: sanitizeNumber(raw.year),
+    seasons: typeof raw.seasons === 'number' ? raw.seasons : undefined,
+    duration: typeof raw.duration === 'string' ? raw.duration : undefined,
+    ageRating: id.startsWith('db-') ? '' : sanitizeString(raw.ageRating),
+    match: sanitizeNumber(raw.match),
+    genres: sanitizeStrings(raw.genres),
+    synopsis: sanitizeString(raw.synopsis),
+    poster,
+    hero,
+    titleStyle: ['glow', 'gothic', 'condensed', 'royal', 'fantasy'].includes(
+      String(raw.titleStyle),
+    )
+      ? (raw.titleStyle as Title['titleStyle'])
+      : 'condensed',
+    titleLines:
+      sanitizeStrings(raw.titleLines).length > 0 ? sanitizeStrings(raw.titleLines) : [name],
+    cardTitleSize: ['sm', 'md', 'lg'].includes(String(raw.cardTitleSize))
+      ? (raw.cardTitleSize as Title['cardTitleSize'])
+      : undefined,
+    language: sanitizeString(raw.language),
+    creator: sanitizeString(raw.creator),
+    cast: sanitizeStrings(raw.cast),
+    episodeLabel: typeof raw.episodeLabel === 'string' ? raw.episodeLabel : undefined,
+    episodes:
+      episodes.length > 0
+        ? episodes
+        : mediaType === 'series' && episodesCount
+          ? placeholderEpisodes(id, episodesCount, sanitizeString(raw.duration) || '45m')
+          : [],
+    isNew: raw.isNew === true,
+    addedOrder: sanitizeNumber(raw.addedOrder),
+    doubanRating:
+      typeof raw.doubanRating === 'number' && Number.isFinite(raw.doubanRating)
+        ? raw.doubanRating
+        : undefined,
+    doubanVotes:
+      typeof raw.doubanVotes === 'number' && Number.isFinite(raw.doubanVotes)
+        ? raw.doubanVotes
+        : undefined,
+    originalName: typeof raw.originalName === 'string' ? raw.originalName : undefined,
+    region: typeof raw.region === 'string' ? raw.region : undefined,
+    pubdate: typeof raw.pubdate === 'string' ? raw.pubdate : undefined,
+    episodesCount,
+  }
 }
 
 const readTitleCache = (): Record<string, Title> => {
   try {
     const stored = localStorage.getItem(TITLE_CACHE_KEY)
     if (!stored) return {}
-    const parsed = JSON.parse(stored) as Record<string, Title>
-    return Object.fromEntries(
-      Object.entries(parsed).map(([id, title]) => [id, migrateCachedTitle(title)]),
-    )
+    const parsed: unknown = JSON.parse(stored)
+    if (!parsed || typeof parsed !== 'object') return {}
+    const entries = Object.entries(parsed as Record<string, unknown>)
+      .map(([id, value]) => {
+        const title = migrateCachedTitle(value)
+        return title ? ([id, title] as const) : null
+      })
+      .filter((entry): entry is readonly [string, Title] => Boolean(entry))
+    return Object.fromEntries(entries)
   } catch {
     return {}
   }
 }
 
+const initialRegistry = readTitleCache()
+const cachedFeedTimes = Object.fromEntries(
+  Object.entries(cachedFeeds).map(([key, entry]) => [
+    key,
+    entry.offsets?.length && entry.ids.every((id) => initialRegistry[id]) ? entry.updatedAt : 0,
+  ]),
+) as Record<string, number>
+const cachedFeedOffsets = Object.fromEntries(
+  Object.entries(cachedFeeds)
+    .filter(([, entry]) => entry.offsets?.length)
+    .map(([key, entry]) => [key, entry.offsets as number[]]),
+) as Record<string, number[]>
+const cachedFeedExhausted = Object.fromEntries(
+  Object.entries(cachedFeeds)
+    .filter(([, entry]) => entry.exhausted)
+    .map(([key]) => [key, true]),
+) as Record<string, boolean>
+
+const initialFeedState = (): Record<string, FeedState> => {
+  const state: Record<string, FeedState> = {}
+  for (const [key, entry] of Object.entries(cachedFeeds)) {
+    const ids = entry.ids.filter((id) => initialRegistry[id])
+    if (ids.length > 0) {
+      state[key] = {
+        ids,
+        loading: false,
+        error: false,
+        exhausted: entry.exhausted === true,
+      }
+    }
+  }
+  state.home ??= { ids: [], loading: true, error: false }
+  return state
+}
+
+const compactTitleForCache = (title: Title): Title => ({ ...title, episodes: undefined })
+
+const persistTitleCache = (registry: Record<string, Title>, pinnedIds?: Set<string>) => {
+  const entries = Object.entries(registry)
+  const pinned = pinnedIds
+    ? entries.filter(([id]) => pinnedIds.has(id))
+    : ([] as [string, Title][])
+  const rest = pinnedIds ? entries.filter(([id]) => !pinnedIds.has(id)) : entries
+  let keep = rest.length
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const subset = [...pinned, ...rest.slice(Math.max(0, rest.length - keep))]
+    try {
+      const payload = JSON.stringify(
+        Object.fromEntries(subset.map(([id, title]) => [id, compactTitleForCache(title)])),
+      )
+      if (payload.length <= TITLE_CACHE_BUDGET || keep <= 50) {
+        localStorage.setItem(TITLE_CACHE_KEY, payload)
+        return
+      }
+    } catch {
+      // Stringify can fail only when the in-memory data is not serializable; retry smaller.
+    }
+    keep = Math.max(50, Math.floor(keep / 2))
+  }
+}
+
 const emptyFeed: FeedState = { ids: [], loading: false, error: false, exhausted: false }
+
+const asStringList = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+
+const asProgressMap = (value: unknown): Record<string, PlaybackProgress> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([id, raw]): [string, PlaybackProgress] | null => {
+      if (!raw || typeof raw !== 'object') return null
+      const entry = raw as Record<string, unknown>
+      if (typeof entry.current !== 'number' || typeof entry.duration !== 'number') return null
+      if (!Number.isFinite(entry.current) || !Number.isFinite(entry.duration)) return null
+      return [
+        id,
+        {
+          current: entry.current,
+          duration: entry.duration,
+          episodeId: typeof entry.episodeId === 'string' ? entry.episodeId : undefined,
+          episodeIndex:
+            typeof entry.episodeIndex === 'number' && Number.isFinite(entry.episodeIndex)
+              ? entry.episodeIndex
+              : undefined,
+          updatedAt:
+            typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt)
+              ? entry.updatedAt
+              : undefined,
+        },
+      ]
+    })
+    .filter((entry): entry is [string, PlaybackProgress] => Boolean(entry))
+  return Object.fromEntries(entries)
+}
 
 const FEED_VIEWS: ViewKey[] = ['new', 'tv', 'movies', 'anime']
 
@@ -120,6 +321,8 @@ const probeKeyFor = (sourceKey: string, vodId: string) => `${sourceKey}|${vodId}
 
 export default function App() {
   const { language, t } = useI18n()
+  const tRef = useRef(t)
+  tRef.current = t
   const [view, setView] = useState<ViewKey>('home')
   const [query, setQuery] = useState('')
   const [slideIndex, setSlideIndex] = useState(0)
@@ -128,20 +331,19 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [toast, setToast] = useState<{ id: number; message: string } | null>(null)
 
-  const [myList, setMyList] = usePersistentState<string[]>('jj-my-list', [])
-  const [later, setLater] = usePersistentState<string[]>('jj-watch-later', [])
-  const [downloads, setDownloads] = usePersistentState<string[]>('jj-downloads', [])
-  const [liked, setLiked] = usePersistentState<string[]>('jj-liked', [])
-  const [lights, setLights] = usePersistentState<boolean>('jj-lights', true)
-  const [autoplayNext, setAutoplayNext] = usePersistentState<boolean>('jj-autoplay-next', true)
-  const [danmakuOn, setDanmakuOn] = usePersistentState<boolean>('jj-danmaku-on', true)
-  const [networkProxy, setNetworkProxy] = usePersistentState<string>('jj-network-proxy', '')
-  useEffect(() => {
-    if (!isDesktopApp) return
-    void import('./play').then(({ setNetworkProxy }) =>
-      setNetworkProxy(networkProxy.trim() ? networkProxy.trim() : null),
-    )
-  }, [networkProxy])
+  const [myList, setMyList] = usePersistentState<string[]>('jj-my-list', [], asStringList)
+  const [later, setLater] = usePersistentState<string[]>('jj-watch-later', [], asStringList)
+  const [liked, setLiked] = usePersistentState<string[]>('jj-liked', [], asStringList)
+  const [lights, setLights] = usePersistentState<boolean>(
+    'jj-lights',
+    true,
+    (value) => typeof value === 'boolean' ? value : true,
+  )
+  const [autoplayNext, setAutoplayNext] = usePersistentState<boolean>(
+    'jj-autoplay-next',
+    true,
+    (value) => typeof value === 'boolean' ? value : true,
+  )
   const autoplayNextRef = useRef(true)
   useEffect(() => {
     autoplayNextRef.current = autoplayNext
@@ -149,13 +351,21 @@ export default function App() {
   const [progressMap, setProgressMap] = usePersistentState<Record<string, PlaybackProgress>>(
     'jj-progress',
     {},
+    asProgressMap,
+  )
+  const progressMapRef = useRef(progressMap)
+  progressMapRef.current = progressMap
+  const pinnedTitleIds = useMemo(
+    () => new Set([...myList, ...later, ...liked]),
+    [myList, later, liked],
   )
 
-  const [registry, setRegistry] = useState<Record<string, Title>>(readTitleCache)
+  const [registry, setRegistry] = useState<Record<string, Title>>(initialRegistry)
   const [feeds, setFeeds] = useState<Record<string, FeedState>>(initialFeedState)
   const feedUpdatedRef = useRef<Record<string, number>>(cachedFeedTimes)
   const [searchResults, setSearchResults] = useState<Title[]>([])
   const [searchBusy, setSearchBusy] = useState(false)
+  const [searchSourceErrors, setSearchSourceErrors] = useState(0)
   const [probes, setProbes] = useState<Record<string, PlayProbeResult>>({})
   const probesRef = useRef<Record<string, PlayProbeResult>>({})
   useEffect(() => {
@@ -163,13 +373,25 @@ export default function App() {
   }, [probes])
   const probeFlightsRef = useRef<Set<string>>(new Set())
   const probeTriedRef = useRef<Set<string>>(new Set())
-  const [sourceNames, setSourceNames] = useState<Record<string, string>>({})
+  const [sourceInfos, setSourceInfos] = useState<PlaySourceInfo[]>([])
+  const sourceNames = useMemo(
+    () => Object.fromEntries(sourceInfos.map((source) => [source.key, source.name])),
+    [sourceInfos],
+  )
+  // 线路面板的跨源聚合线路(每 title 会话内聚合一次)
+  const [aggregateLines, setAggregateLines] = useState<AggregateLine[]>([])
+  const aggregateLinesRef = useRef<AggregateLine[]>([])
+  useEffect(() => {
+    aggregateLinesRef.current = aggregateLines
+  }, [aggregateLines])
+  const aggregateTitleRef = useRef('')
+  const aggregateRequestRef = useRef(0)
 
   useEffect(() => {
     if (!isDesktopApp) return
     void playSources()
       .then((list) => {
-        setSourceNames(Object.fromEntries(list.map((source) => [source.key, source.name])))
+        setSourceInfos(list)
       })
       .catch(() => undefined)
   }, [])
@@ -180,22 +402,36 @@ export default function App() {
   }, [feeds])
 
   const inflightRef = useRef<Set<string>>(new Set())
-  const feedOffsetsRef = useRef<Record<string, number[]>>({})
-  const [feedExhaustedMap, setFeedExhaustedMap] = useState<Record<string, boolean>>({})
+  const prefetchedFeedsRef = useRef<Set<string>>(new Set())
+  const feedOffsetsRef = useRef<Record<string, number[]>>(cachedFeedOffsets)
+  const feedEmptyRoundsRef = useRef<Record<string, number>>({})
+  const [feedExhaustedMap, setFeedExhaustedMap] = useState<Record<string, boolean>>(
+    cachedFeedExhausted,
+  )
+
+  const writeFeedCache = useCallback(
+    (feedKey: string, ids: string[], offsets: number[], exhausted: boolean) => {
+      try {
+        const cache = readFeedCache()
+        cache[feedKey] = {
+          ids,
+          updatedAt: feedUpdatedRef.current[feedKey] ?? Date.now(),
+          offsets,
+          exhausted,
+        }
+        localStorage.setItem(FEED_CACHE_KEY, JSON.stringify(cache))
+      } catch {
+        // feed cache is an optimization only
+      }
+    },
+    [],
+  )
 
   useEffect(() => {
-    try {
-      localStorage.setItem(TITLE_CACHE_KEY, JSON.stringify(registry))
-    } catch {
-      // storage quota exceeded — keep only the freshest 300 entries
-      try {
-        const trimmed = Object.values(registry).slice(-300)
-        localStorage.setItem(TITLE_CACHE_KEY, JSON.stringify(Object.fromEntries(trimmed.map((entry) => [entry.id, entry]))))
-      } catch {
-        // give up persisting this round
-      }
-    }
-  }, [registry])
+    // 防抖写入:搜索/瀑布流会高频注册条目,全量序列化不能每次都做。
+    const timer = window.setTimeout(() => persistTitleCache(registry, pinnedTitleIds), 800)
+    return () => window.clearTimeout(timer)
+  }, [registry, pinnedTitleIds])
 
   const register = useCallback((incoming: Title[]) => {
     if (incoming.length === 0) return
@@ -209,12 +445,45 @@ export default function App() {
           changed = true
           continue
         }
-        const richer =
+        // 只有能补齐既有数据缺口时才合并；合并按字段进行，空值不得覆盖已有内容。
+        const improves =
           (title.synopsis && !existing.synopsis) ||
           (title.cast.length > 0 && existing.cast.length === 0) ||
-          (title.genres.length > 0 && existing.genres.length === 0)
-        if (richer) {
-          next[title.id] = { ...existing, ...title }
+          (title.genres.length > 0 && existing.genres.length === 0) ||
+          (Boolean(title.episodes?.length) && !existing.episodes?.length) ||
+          (Boolean(title.poster) && !existing.poster) ||
+          (Boolean(title.hero) && !existing.hero) ||
+          (Boolean(title.originalName) && !existing.originalName) ||
+          (Boolean(title.region) && !existing.region) ||
+          (Boolean(title.pubdate) && !existing.pubdate) ||
+          (Boolean(title.creator) && !existing.creator) ||
+          (title.year > 0 && existing.year === 0) ||
+          (title.match > 0 && existing.match === 0) ||
+          (title.episodesCount !== undefined && existing.episodesCount === undefined) ||
+          (title.doubanRating !== undefined && existing.doubanRating === undefined) ||
+          (title.doubanVotes !== undefined && existing.doubanVotes === undefined)
+        if (improves) {
+          next[title.id] = {
+            ...existing,
+            ...title,
+            name: title.name || existing.name,
+            originalName: title.originalName || existing.originalName,
+            synopsis: title.synopsis || existing.synopsis,
+            poster: title.poster || existing.poster,
+            hero: title.hero || existing.hero,
+            creator: title.creator || existing.creator,
+            region: title.region || existing.region,
+            pubdate: title.pubdate || existing.pubdate,
+            duration: title.duration || existing.duration,
+            cast: title.cast.length > 0 ? title.cast : existing.cast,
+            genres: title.genres.length > 0 ? title.genres : existing.genres,
+            episodes: title.episodes?.length ? title.episodes : existing.episodes,
+            year: title.year > 0 ? title.year : existing.year,
+            match: title.match > 0 ? title.match : existing.match,
+            doubanRating: title.doubanRating ?? existing.doubanRating,
+            doubanVotes: title.doubanVotes ?? existing.doubanVotes,
+            episodesCount: title.episodesCount ?? existing.episodesCount,
+          }
           changed = true
         }
       }
@@ -231,74 +500,91 @@ export default function App() {
   const loadFeed = useCallback(
     async (feedKey: string, force = false) => {
       const parts = DOUBAN_FEEDS[feedKey]
-      if (!parts) return
-      if (inflightRef.current.has(feedKey)) return
+      if (!parts) return false
+      if (inflightRef.current.has(feedKey)) return false
       const current = feedsRef.current[feedKey]
       const fresh =
         Boolean(current?.ids.length) &&
         Date.now() - (feedUpdatedRef.current[feedKey] ?? 0) < FEED_TTL
-      if (!force && fresh) return
+      if (!force && fresh) return true
+      const existingIds = current?.ids ?? []
       inflightRef.current.add(feedKey)
       try {
-      setFeeds((previous) => ({
-        ...previous,
-        [feedKey]: { ids: previous[feedKey]?.ids ?? [], loading: true, error: false },
-      }))
-      const results = await Promise.all(
-        parts.map((part) => fetchDoubanList(part.kind, part.tag, part.limit, 0, part.sort)),
-      )
-      const seen = new Set<string>()
-      const buckets = results.map((subjects, index) => {
-        const kind = parts[index].kind
-        return (subjects ?? [])
-          .filter((subject) => {
-            if (seen.has(subject.id)) return false
-            seen.add(subject.id)
-            return true
-          })
-          .map((subject) => subjectToTitle(subject, kind))
-      })
-      const merged: Title[] = []
-      const longest = buckets.reduce((max, bucket) => Math.max(max, bucket.length), 0)
-      for (let index = 0; index < longest; index += 1) {
-        for (const bucket of buckets) {
-          if (bucket[index]) merged.push(bucket[index])
+        setFeeds((previous) => ({
+          ...previous,
+          [feedKey]: { ids: previous[feedKey]?.ids ?? [], loading: true, error: false },
+        }))
+        const results = await Promise.all(
+          parts.map((part) => fetchDoubanList(part.kind, part.tag, part.limit, 0, part.sort)),
+        )
+        const anyFailed = results.some((subjects) => subjects === null)
+        const seen = new Set<string>()
+        const buckets = results.map((subjects, index) => {
+          const kind = parts[index].kind
+          return (subjects ?? [])
+            .filter((subject) => {
+              if (seen.has(subject.id)) return false
+              seen.add(subject.id)
+              return true
+            })
+            .map((subject) => subjectToTitle(subject, kind))
+        })
+        const merged: Title[] = []
+        const longest = buckets.reduce((max, bucket) => Math.max(max, bucket.length), 0)
+        for (let index = 0; index < longest; index += 1) {
+          for (const bucket of buckets) {
+            if (bucket[index]) merged.push(bucket[index])
+          }
         }
-      }
-      if (merged.length === 0) {
+        if (merged.length === 0) {
+          setFeeds((previous) => ({
+            ...previous,
+            [feedKey]: {
+              ids: existingIds,
+              loading: false,
+              error: existingIds.length ? false : true,
+            },
+          }))
+          notify(tRef.current('common.loadFailed'))
+          return false
+        }
+        register(merged)
+        const mergedIds = merged.map((title) => title.id)
+        // 部分源失败时保留旧条目，避免首屏只刷新到一半就“少了一截”。
+        const ids = anyFailed
+          ? [...mergedIds, ...existingIds.filter((id) => !mergedIds.includes(id))]
+          : mergedIds
+        // 失败的 part 从 0 重新开始，下一轮才不会跳过第一页。
+        const offsets = results.map((subjects, index) =>
+          subjects === null ? 0 : parts[index].limit,
+        )
+        feedOffsetsRef.current[feedKey] = offsets
+        feedEmptyRoundsRef.current[feedKey] = 0
+        feedUpdatedRef.current[feedKey] = Date.now()
+        setFeedExhaustedMap((previous) => ({ ...previous, [feedKey]: false }))
+        writeFeedCache(feedKey, ids, offsets, false)
+        setFeeds((previous) => ({
+          ...previous,
+          [feedKey]: { ids, loading: false, error: false, exhausted: false },
+        }))
+        return true
+      } catch (error) {
+        console.warn('[jj] feed load failed', feedKey, error)
         setFeeds((previous) => ({
           ...previous,
           [feedKey]: {
-            ids: previous[feedKey]?.ids ?? [],
+            ids: existingIds,
             loading: false,
-            error: previous[feedKey]?.ids.length ? false : true,
+            error: existingIds.length === 0,
           },
         }))
-        notify(t('common.loadFailed'))
-        return
-      }
-      register(merged)
-      const ids = merged.map((title) => title.id)
-      const updatedAt = Date.now()
-      feedOffsetsRef.current[feedKey] = parts.map((part) => part.limit)
-      setFeedExhaustedMap((previous) => ({ ...previous, [feedKey]: false }))
-      feedUpdatedRef.current[feedKey] = updatedAt
-      try {
-        const cache = readFeedCache()
-        cache[feedKey] = { ids, updatedAt }
-        localStorage.setItem(FEED_CACHE_KEY, JSON.stringify(cache))
-      } catch {
-        // feed cache is an optimization only
-      }
-      setFeeds((previous) => ({
-        ...previous,
-        [feedKey]: { ids, loading: false, error: false },
-      }))
+        notify(tRef.current('common.loadFailed'))
+        return false
       } finally {
         inflightRef.current.delete(feedKey)
       }
     },
-    [notify, register, t],
+    [notify, register, writeFeedCache],
   )
 
   useEffect(() => {
@@ -309,13 +595,19 @@ export default function App() {
     if (FEED_VIEWS.includes(view)) void loadFeed(view)
   }, [view, loadFeed])
 
-  // 无限瀑布流:追加下一页(各 part 独立游标,合并去重;无新增即判定到底)
+  // 无限瀑布流:追加下一页(各 part 独立游标,合并去重;连续无新增才判定到底)
   const loadFeedNext = useCallback(
     async (feedKey: string) => {
       const parts = DOUBAN_FEEDS[feedKey]
-      if (!parts || inflightRef.current.has(feedKey)) return
+      if (!parts || inflightRef.current.has(feedKey)) return false
       const offsets = feedOffsetsRef.current[feedKey]
-      if (!offsets) return // 首屏尚未完成,无从追加
+      if (
+        !offsets ||
+        offsets.length !== parts.length ||
+        offsets.some((offset) => !Number.isFinite(offset))
+      ) {
+        return false // 首屏尚未完成或旧缓存缺少游标
+      }
       inflightRef.current.add(feedKey)
       try {
         const results = await Promise.all(
@@ -323,11 +615,17 @@ export default function App() {
             fetchDoubanList(part.kind, part.tag, part.limit, offsets[index], part.sort),
           ),
         )
+        // fetchDoubanList 失败返回 null（不是 throw）：此时不能判定到底，保持哨兵等重试。
+        let anyFailed = false
         const existing = new Set(feedsRef.current[feedKey]?.ids ?? [])
         const buckets = results.map((subjects, index) => {
           const kind = parts[index].kind
-          feedOffsetsRef.current[feedKey][index] += (subjects ?? []).length
-          return (subjects ?? [])
+          if (subjects === null) {
+            anyFailed = true
+            return []
+          }
+          feedOffsetsRef.current[feedKey][index] += subjects.length
+          return subjects
             .map((subject) => subjectToTitle(subject, kind))
             .filter((title) => {
               if (existing.has(title.id)) return false
@@ -343,27 +641,52 @@ export default function App() {
           }
         }
         if (merged.length === 0) {
-          setFeedExhaustedMap((previous) => ({ ...previous, [feedKey]: true }))
-          return
+          if (anyFailed) return false
+          // 豆瓣 recommend 流会返回重复页；连续 3 轮无新增才判定到底。
+          const rounds = (feedEmptyRoundsRef.current[feedKey] ?? 0) + 1
+          feedEmptyRoundsRef.current[feedKey] = rounds
+          if (rounds >= FEED_EMPTY_ROUNDS_LIMIT) {
+            setFeedExhaustedMap((previous) => ({ ...previous, [feedKey]: true }))
+            const ids = feedsRef.current[feedKey]?.ids ?? []
+            writeFeedCache(feedKey, ids, feedOffsetsRef.current[feedKey], true)
+          }
+          return false
         }
+        feedEmptyRoundsRef.current[feedKey] = 0
         register(merged)
+        const ids = [...(feedsRef.current[feedKey]?.ids ?? []), ...merged.map((title) => title.id)]
+        writeFeedCache(feedKey, ids, feedOffsetsRef.current[feedKey], false)
         setFeeds((previous) => ({
           ...previous,
           [feedKey]: {
             ...previous[feedKey],
-            ids: [...(previous[feedKey]?.ids ?? []), ...merged.map((title) => title.id)],
+            ids,
             loading: false,
             error: false,
+            exhausted: false,
           },
         }))
+        return true
       } catch {
-        // 追加失败静默,哨兵会再次触发
+        // 追加失败静默,哨兵会在退避后再次触发
+        return false
       } finally {
         inflightRef.current.delete(feedKey)
       }
     },
-    [register],
+    [register, writeFeedCache],
   )
+
+  const loadMoreForView = useCallback(() => loadFeedNext(view), [loadFeedNext, view])
+
+  useEffect(() => {
+    if (!FEED_VIEWS.includes(view)) return
+    const feed = feeds[view]
+    if (!feed || feed.loading || feed.error || feed.ids.length === 0) return
+    if (feedExhaustedMap[view] || prefetchedFeedsRef.current.has(view)) return
+    prefetchedFeedsRef.current.add(view)
+    void loadFeedNext(view)
+  }, [view, feeds, feedExhaustedMap, loadFeedNext])
 
   const feedItems = useCallback(
     (feedKey: string): Title[] => {
@@ -383,36 +706,51 @@ export default function App() {
     if (!needle) {
       setSearchResults([])
       setSearchBusy(false)
+      setSearchSourceErrors(0)
       return
     }
+    setSearchResults([])
     setSearchBusy(true)
-    const timer = window.setTimeout(async () => {
-      const suggestions = await fetchDoubanSuggest(needle).catch(() => [])
-      const doubanTitles = (suggestions ?? []).map(suggestToTitle)
-      register(doubanTitles)
-      // 播放源聚合搜索:各源并发,结果注册进片库并写入匹配缓存,点开即播
-      let sourceTitles: Title[] = []
-      try {
-        const response = await playSearch(needle)
-        sourceTitles = (response.items ?? []).slice(0, 40).map((item: PlaySearchItem) => {
-          const id = `ps-${item.sourceKey}-${item.vodId}`
-          writeMatch(id, {
-            sourceKey: item.sourceKey,
-            vodId: item.vodId,
-            lineIndex: 0,
-            matchedName: item.name,
-          })
+    setSearchSourceErrors(0)
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      const doubanTitles: Title[] = []
+      const sourceTitles: Title[] = []
+      let pending = 2
+      const publish = () => {
+        if (cancelled) return
+        const byKey = new Map<string, Title>()
+        const keyOf = (title: Title) => title.originalName || title.name
+        for (const title of doubanTitles) {
+          const key = keyOf(title)
+          if (!byKey.has(key)) byKey.set(key, title)
+        }
+        for (const title of sourceTitles) {
+          const key = keyOf(title)
+          if (!byKey.has(key)) byKey.set(key, title)
+        }
+        setSearchResults([...byKey.values()])
+      }
+      const settle = () => {
+        if (cancelled) return
+        pending -= 1
+        if (pending <= 0) setSearchBusy(false)
+        publish()
+      }
+      const mapSourceItems = (items: PlaySearchItem[]) =>
+        items.slice(0, 40).map((item) => {
+          const id = `ps-${item.sourceKey.replace(/-/g, '~')}-${item.vodId}`
           const typeName = item.typeName || ''
           return {
             id,
             name: item.name,
-            mediaType: /动漫|动画|番剧|综艺|纪录|剧/.test(typeName) ? 'series' : 'film',
+            mediaType: sourceTypeIsSeries(typeName) ? 'series' : 'film',
             year: Number.parseInt(item.year, 10) || 0,
             ageRating: '',
             match: 0,
             genres: typeName ? [typeName] : [],
             synopsis: item.actor ? `主演：${stripHtml(item.actor)}` : '',
-            poster: item.pic,
+            poster: sourcePoster(item.pic),
             titleStyle: 'condensed',
             titleLines: [item.name],
             language: item.lang || '',
@@ -423,30 +761,54 @@ export default function App() {
             remarks: item.remarks,
           } as Title
         })
-        register(sourceTitles)
-      } catch {
-        // 桌面端不可用或全部源失败时,仅展示豆瓣结果
+      const mergeSourceItems = (items: PlaySearchItem[]) => {
+        const known = new Set(sourceTitles.map((title) => title.id))
+        const extra = mapSourceItems(items).filter((title) => !known.has(title.id))
+        if (extra.length === 0) return
+        sourceTitles.push(...extra)
+        register(extra)
+        publish()
       }
-      // 去重合并;同名条目 AniCh 聚合源优先(多线路测速选优 + 弹幕)
-      const byKey = new Map<string, Title>()
-      const keyOf = (title: Title) => title.originalName || title.name
-      for (const title of doubanTitles) {
-        const key = keyOf(title)
-        if (!byKey.has(key)) byKey.set(key, title)
-      }
-      for (const title of sourceTitles) {
-        const key = keyOf(title)
-        const existing = byKey.get(key)
-        if (!existing) {
-          byKey.set(key, title)
-        } else if (title.id.startsWith('ps-anich-') && !existing.id.startsWith('ps-anich-')) {
-          byKey.set(key, title)
+      // 豆瓣联想与播放源搜索并行；任意一方先返回就先展示，不互相阻塞。
+      void (async () => {
+        try {
+          const suggestions = await fetchDoubanSuggest(needle).catch(() => [])
+          if (cancelled) return
+          doubanTitles.push(...(suggestions ?? []).map(suggestToTitle))
+          register(doubanTitles)
+        } finally {
+          settle()
         }
-      }
-      setSearchResults([...byKey.values()])
-      setSearchBusy(false)
+      })()
+      void (async () => {
+        try {
+          const response = await playSearch(needle)
+          if (cancelled) return
+          const errors = response.errors?.length ?? 0
+          setSearchSourceErrors(errors)
+          sourceTitles.push(...mapSourceItems(response.items ?? []))
+          register(sourceTitles)
+          publish()
+          // 慢源会转后台写缓存；稍后再查一次，通常能命中缓存补齐结果。
+          if (errors > 0) {
+            await new Promise((resolve) => window.setTimeout(resolve, 2800))
+            if (cancelled) return
+            const retry = await playSearch(needle)
+            if (cancelled) return
+            setSearchSourceErrors(retry.errors?.length ?? 0)
+            mergeSourceItems(retry.items ?? [])
+          }
+        } catch {
+          // 桌面端不可用或全部源失败时,仅展示豆瓣结果
+        } finally {
+          settle()
+        }
+      })()
     }, 350)
-    return () => window.clearTimeout(timer)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
   }, [query, register])
 
   useEffect(() => {
@@ -508,6 +870,12 @@ export default function App() {
 
   const playReqRef = useRef(0)
   const playbackRef = useRef<PlaybackState | null>(null)
+  // 播放器实时位置（Theater 每秒上报一次）：自动换源定位用，避免逐秒 setState。
+  const liveTimeRef = useRef<{ current: number; duration: number } | null>(null)
+  const liveCurrent = useCallback(
+    () => liveTimeRef.current?.current ?? playbackRef.current?.current ?? 0,
+    [],
+  )
   const autoRecoverRef = useRef({
     titleId: '',
     failedSources: new Set<string>(),
@@ -537,6 +905,43 @@ export default function App() {
   useEffect(() => {
     playbackRef.current = playback
   }, [playback])
+
+  // 窗口关闭/切后台时尽量补写一次实时进度，避免丢掉最后 5 秒。
+  useEffect(() => {
+    const flush = () => {
+      const session = playbackRef.current
+      const live = liveTimeRef.current
+      if (!session || !live || !(live.duration > 0) || !(live.current > 0)) return
+      try {
+        const stored: unknown = JSON.parse(localStorage.getItem('jj-progress') ?? '{}')
+        const progress =
+          stored && typeof stored === 'object' && !Array.isArray(stored)
+            ? (stored as Record<string, PlaybackProgress>)
+            : {}
+        progress[session.titleId] = {
+          current: live.current,
+          duration: live.duration,
+          episodeId: session.episodeId,
+          episodeIndex: session.episodeIndex,
+          updatedAt: Date.now(),
+        }
+        localStorage.setItem('jj-progress', JSON.stringify(progress))
+      } catch {
+        // best-effort only
+      }
+    }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') flush()
+    }
+    window.addEventListener('beforeunload', flush)
+    window.addEventListener('pagehide', flush)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      window.removeEventListener('beforeunload', flush)
+      window.removeEventListener('pagehide', flush)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  }, [])
 
   const prefetchNextEpisode = useCallback(
     (
@@ -639,7 +1044,7 @@ export default function App() {
           }
           state.reason = 'startup'
           if (state.resumePosition === undefined && current) {
-            state.resumePosition = current.current
+            state.resumePosition = liveCurrent()
           }
           console.info('[jj] startup timeout -> switch line/source', {
             titleId: current?.titleId,
@@ -723,6 +1128,24 @@ export default function App() {
     [setProgressMap],
   )
 
+  // 聚合所有候选源的线路(每 title 一次):线路面板据此展示全集源/单集源与跨源切换。
+  const refreshAggregateLines = useCallback(
+    (title: Title) => {
+      if (aggregateTitleRef.current === title.id && aggregateLinesRef.current.length > 0) return
+      aggregateTitleRef.current = title.id
+      const requestId = aggregateRequestRef.current + 1
+      aggregateRequestRef.current = requestId
+      void aggregateSourceLines(title, { sourceNames, maxSources: 6 })
+        .then((result) => {
+          if (aggregateTitleRef.current !== title.id) return
+          if (aggregateRequestRef.current !== requestId) return
+          setAggregateLines(result.lines)
+        })
+        .catch(() => undefined)
+    },
+    [sourceNames],
+  )
+
   const beginPlayback = useCallback(
     (
       title: Title,
@@ -740,10 +1163,18 @@ export default function App() {
         previousSourceKey?: string
         maxCandidates?: number
         autoReason?: 'failure' | 'stall' | 'startup'
+        preferredSourceKey?: string
       },
     ) => {
       const requestId = playReqRef.current + 1
       playReqRef.current = requestId
+      liveTimeRef.current = null
+      if (aggregateTitleRef.current !== title.id) {
+        aggregateTitleRef.current = title.id
+        aggregateRequestRef.current += 1
+        aggregateLinesRef.current = []
+        setAggregateLines([])
+      }
       const episodeIndex =
         request.episodeIndex ??
         (request.episodeNumber !== undefined
@@ -814,6 +1245,7 @@ export default function App() {
           target.sourceKey,
           target.vodId,
         )
+        refreshAggregateLines(title)
         return
       }
 
@@ -821,11 +1253,7 @@ export default function App() {
         try {
           const match = readMatch(title.id)
           const validMatch =
-            match &&
-            matchTitleName(title, match.matchedName) &&
-            (!isAnimeTitle(title) || match.sourceKey === 'anich')
-              ? match
-              : null
+            match && matchTitleName(title, match.matchedName) ? match : null
           const probe =
             request.lineIndex === undefined && request.excludeSourceKey === undefined && validMatch
               ? probesRef.current[probeKeyFor(validMatch.sourceKey, validMatch.vodId)]
@@ -836,9 +1264,11 @@ export default function App() {
             resolved = await resolveSession(title, {
               episodeIndex,
               preferredLine,
+              preferredSourceKey: request.preferredSourceKey,
               excludeSourceKey: request.excludeSourceKey,
               excludeSourceKeys,
               maxCandidates: request.maxCandidates,
+              detail: request.detail,
               onSourceFailure: (sourceKey, sourceError) => {
                 const state = autoRecoverRef.current
                 if (state.titleId === title.id) state.failedSources.add(sourceKey)
@@ -866,6 +1296,7 @@ export default function App() {
             }
           }
           if (playReqRef.current !== requestId) return
+          refreshAggregateLines(title)
           const mappedEpisodeId =
             title.mediaType === 'series' ? episodeIdForIndex(title, resolved.episodeIndex) : undefined
           setPlayback((current) =>
@@ -1014,6 +1445,7 @@ export default function App() {
       markSourceCooldown,
       notify,
       prefetchNextEpisode,
+      refreshAggregateLines,
       resetAutoRecover,
       scheduleAutoRecover,
       sourceNames,
@@ -1027,7 +1459,7 @@ export default function App() {
       const title = resolveTitle(id)
       if (!title) return
 
-      const saved = progressMap[id]
+      const saved = progressMapRef.current[id]
       const initialEpisode = initialEpisodeFor(title)
       const savedNumber = saved?.episodeId
         ? episodeNumberOf(title, saved.episodeId)
@@ -1055,11 +1487,12 @@ export default function App() {
       setDetailId(null)
       setDrawerOpen(false)
     },
-    [beginPlayback, progressMap, resetAutoRecover, resolveTitle],
+    [beginPlayback, resetAutoRecover, resolveTitle],
   )
 
   const handlePlaybackLiveTime = useCallback(
     (current: number, duration: number) => {
+      liveTimeRef.current = { current, duration }
       const state = autoRecoverRef.current
       if (state.recovering && state.resumePosition !== undefined) {
         if (Math.abs(current - state.resumePosition) <= 3) {
@@ -1074,11 +1507,6 @@ export default function App() {
           state.resumeReachedAt = undefined
         }
       }
-      setPlayback((value) =>
-        value && (value.current !== current || value.duration !== duration)
-          ? { ...value, current, duration }
-          : value,
-      )
     },
     [],
   )
@@ -1095,18 +1523,41 @@ export default function App() {
     setPlayback((value) =>
       value ? { ...value, slowStartup: false, autoRecovering: false } : value,
     )
-  }, [clearStartupTimers])
+    // probe 自愈:若当前源的探测全失败但实际已能起播,后台重探一次,
+    // 让线路面板的速度/画质标注恢复正常(旧结果会话内不缓存失败态)。
+    const session = playbackRef.current
+    const title = session ? resolveTitle(session.titleId) : null
+    if (session?.target && title) {
+      const key = probeKeyFor(session.target.sourceKey, session.target.vodId)
+      const existing = probesRef.current[key]
+      const allFailed = existing && existing.lines.length > 0 && existing.lines.every((line) => !line.ok)
+      if ((!existing || allFailed) && !probeFlightsRef.current.has(key)) {
+        probeFlightsRef.current.add(key)
+        void playProbe(session.target.sourceKey, session.target.vodId)
+          .then((result) => setProbes((previous) => ({ ...previous, [key]: result })))
+          .catch(() => undefined)
+          .finally(() => probeFlightsRef.current.delete(key))
+      }
+    }
+  }, [clearStartupTimers, resolveTitle])
 
+  // 换集瞬间 Theater 会补发上一集的最终快照（episodeId 是旧集）：
+  // 这种快照只写进进度表，绝不写回当前播放状态，否则新集会被旧位置污染。
   const handlePlaybackProgress = useCallback(
-    (current: number, duration: number) => {
+    (current: number, duration: number, episodeId?: string, episodeIndex?: number) => {
       const session = playbackRef.current
       if (!session) return
-      saveProgress(session.titleId, session.episodeId, session.episodeIndex, current, duration)
-      setPlayback((state) =>
-        state && state.titleId === session.titleId && state.current !== current
-          ? { ...state, current, duration }
-          : state,
-      )
+      const matchesSession = episodeId === undefined || episodeId === session.episodeId
+      if (matchesSession) {
+        saveProgress(session.titleId, session.episodeId, session.episodeIndex, current, duration)
+        setPlayback((state) =>
+          state && state.titleId === session.titleId && state.current !== current
+            ? { ...state, current, duration }
+            : state,
+        )
+      } else {
+        saveProgress(session.titleId, episodeId, episodeIndex, current, duration)
+      }
     },
     [saveProgress],
   )
@@ -1148,7 +1599,7 @@ export default function App() {
       }
       const state = autoRecoverRef.current
       state.reason = error.detail?.includes('stalled') ? 'stall' : 'failure'
-      if (state.resumePosition === undefined) state.resumePosition = session.current
+      if (state.resumePosition === undefined) state.resumePosition = liveCurrent()
       console.info(
         error.detail?.includes('stalled')
           ? '[jj] stalled 8s -> auto switch'
@@ -1231,10 +1682,10 @@ export default function App() {
       episodeId: current.episodeId,
       episodeNumber: current.episodeNumber,
       episodeIndex: current.episodeIndex,
-      startAt: current.current,
+      startAt: liveCurrent(),
       detail: current.detail,
     })
-  }, [beginPlayback, resetAutoRecover, resolveTitle])
+  }, [beginPlayback, liveCurrent, resetAutoRecover, resolveTitle])
 
   const switchLine = useCallback(
     (lineIndex: number) => {
@@ -1260,12 +1711,12 @@ export default function App() {
         episodeNumber: title.mediaType === 'series' ? episodeIndex + 1 : undefined,
         episodeIndex,
         lineIndex,
-        startAt: current.current,
+        startAt: liveCurrent(),
         detail: current.detail,
         stayOnSource: true,
       })
     },
-    [beginPlayback, notify, resetAutoRecover, resolveTitle, t],
+    [beginPlayback, liveCurrent, notify, resetAutoRecover, resolveTitle, t],
   )
 
   const switchSource = useCallback(() => {
@@ -1280,9 +1731,9 @@ export default function App() {
       episodeNumber: title.mediaType === 'series' ? episodeIndex + 1 : undefined,
       episodeIndex,
       excludeSourceKey: current.sourceKey,
-      startAt: current.current,
+      startAt: liveCurrent(),
     })
-  }, [beginPlayback, resetAutoRecover, resolveTitle])
+  }, [beginPlayback, liveCurrent, resetAutoRecover, resolveTitle])
 
   const selectSourceEpisode = useCallback(
     (index: number) => {
@@ -1306,7 +1757,31 @@ export default function App() {
         stayOnSource: true,
       })
     },
-    [beginPlayback, resetAutoRecover, resolveTitle, startStartupTimers],
+    [beginPlayback, resetAutoRecover, resolveTitle],
+  )
+
+  // 线路面板跨源切换:直接使用聚合时缓存的 detail,并强制 resolveSession 选中该源。
+  const switchToLine = useCallback(
+    (sourceKey: string, lineIndex: number) => {
+      const current = playbackRef.current
+      if (!current) return
+      const title = resolveTitle(current.titleId)
+      if (!title) return
+      const entry = aggregateLinesRef.current.find(
+        (item) => item.sourceKey === sourceKey && item.lineIndex === lineIndex,
+      )
+      resetAutoRecover(current.titleId)
+      beginPlayback(title, {
+        episodeId: current.episodeId,
+        episodeIndex: current.episodeIndex,
+        lineIndex,
+        startAt: liveCurrent(),
+        detail: entry?.detail,
+        stayOnSource: true,
+        preferredSourceKey: sourceKey,
+      })
+    },
+    [beginPlayback, liveCurrent, resetAutoRecover, resolveTitle],
   )
 
   const handlePlaybackEnded = useCallback(() => {
@@ -1390,7 +1865,7 @@ export default function App() {
           ? {
               ...value,
               status: 'error',
-              error: { code: 'no-source', detail: '自动换源已尝试 3 个源' },
+              error: { code: 'no-source' },
               playing: false,
               slowStartup: false,
               autoRecovering: false,
@@ -1412,7 +1887,7 @@ export default function App() {
       state.triedLines = new Set()
       state.lineAttempts = 0
     }
-    if (state.resumePosition === undefined) state.resumePosition = current.current
+    if (state.resumePosition === undefined) state.resumePosition = liveCurrent()
     const position = state.resumePosition
     if (state.failedSources.size >= 3) {
       finishNoSource()
@@ -1479,7 +1954,7 @@ export default function App() {
       maxCandidates: Math.max(1, 3 - state.failedSources.size),
       autoReason: state.reason,
     })
-  }, [beginPlayback, clearStartupTimers, markSourceCooldown, resetAutoRecover, resolveTitle])
+  }, [beginPlayback, clearStartupTimers, liveCurrent, markSourceCooldown, resetAutoRecover, resolveTitle])
   autoRecoverHandlerRef.current = handleAutoRecover
   const triggerStallSwitch = useCallback(
     (message: string, extra: Record<string, unknown>) => {
@@ -1491,7 +1966,7 @@ export default function App() {
       const state = autoRecoverRef.current
       state.reason = 'stall'
       state.recovering = false
-      if (state.resumePosition === undefined) state.resumePosition = current.current
+      if (state.resumePosition === undefined) state.resumePosition = liveCurrent()
       console.info(message, {
         ...extra,
         titleId: current.titleId,
@@ -1513,7 +1988,7 @@ export default function App() {
       )
       handleAutoRecover()
     },
-    [handleAutoRecover, resetAutoRecover],
+    [handleAutoRecover, liveCurrent, resetAutoRecover],
   )
 
   const handleShortBuffer = useCallback((stallMs: number) => {
@@ -1543,6 +2018,10 @@ export default function App() {
     setView(next)
     setQuery('')
     setDrawerOpen(false)
+    window.requestAnimationFrame(() => {
+      const scroller = document.querySelector<HTMLElement>('.main-scroll')
+      if (scroller) scroller.scrollTop = 0
+    })
     if (FEED_VIEWS.includes(next)) {
       setFeeds((previous) =>
         previous[next]
@@ -1560,49 +2039,47 @@ export default function App() {
     [language, resolveTitle],
   )
 
-  const toggleList = (id: string) => {
-    const added = !myList.includes(id)
-    const name = nameOf(id)
-    setMyList(added ? [id, ...myList] : myList.filter((item) => item !== id))
-    notify(
-      added
-        ? t('toast.addedToList', { name })
-        : t('toast.removedFromList', { name }),
-    )
-  }
+  const toggleList = useCallback(
+    (id: string) => {
+      const added = !myList.includes(id)
+      const name = nameOf(id)
+      setMyList(added ? [id, ...myList] : myList.filter((item) => item !== id))
+      notify(
+        added
+          ? t('toast.addedToList', { name })
+          : t('toast.removedFromList', { name }),
+      )
+    },
+    [myList, nameOf, notify, setMyList, t],
+  )
 
-  const toggleLater = (id: string) => {
-    const added = !later.includes(id)
-    const name = nameOf(id)
-    setLater(added ? [id, ...later] : later.filter((item) => item !== id))
-    notify(
-      added
-        ? t('toast.addedToLater', { name })
-        : t('toast.removedFromLater', { name }),
-    )
-  }
+  const toggleLater = useCallback(
+    (id: string) => {
+      const added = !later.includes(id)
+      const name = nameOf(id)
+      setLater(added ? [id, ...later] : later.filter((item) => item !== id))
+      notify(
+        added
+          ? t('toast.addedToLater', { name })
+          : t('toast.removedFromLater', { name }),
+      )
+    },
+    [later, nameOf, notify, setLater, t],
+  )
 
-  const toggleDownload = (id: string) => {
-    const added = !downloads.includes(id)
-    const name = nameOf(id)
-    setDownloads(added ? [id, ...downloads] : downloads.filter((item) => item !== id))
-    notify(
-      added
-        ? t('toast.downloaded', { name })
-        : t('toast.removedDownload', { name }),
-    )
-  }
+  const toggleLike = useCallback(
+    (id: string) => {
+      const added = !liked.includes(id)
+      const name = nameOf(id)
+      setLiked(added ? [id, ...liked] : liked.filter((item) => item !== id))
+      notify(added ? t('toast.liked', { name }) : t('toast.ratingRemoved'))
+    },
+    [liked, nameOf, notify, setLiked, t],
+  )
 
-  const toggleLike = (id: string) => {
-    const added = !liked.includes(id)
-    const name = nameOf(id)
-    setLiked(added ? [id, ...liked] : liked.filter((item) => item !== id))
-    notify(added ? t('toast.liked', { name }) : t('toast.ratingRemoved'))
-  }
-
-  const openDetail = (id: string) => {
+  const openDetail = useCallback((id: string) => {
     setDetailId(id)
-  }
+  }, [])
 
   const detailTitle = detailId ? resolveTitle(detailId) : null
   const playingTitle = playback ? resolveTitle(playback.titleId) : null
@@ -1620,7 +2097,8 @@ export default function App() {
     (title: Title) => {
       if (!title.id.startsWith('db-')) return
       if (detailDoneRef.current.has(title.id) || detailRequestsRef.current.has(title.id)) return
-      if (title.synopsis && title.cast.length > 0) {
+      const hasSeriesEpisodes = title.mediaType !== 'series' || Boolean(title.episodes?.length)
+      if (title.synopsis && title.cast.length > 0 && hasSeriesEpisodes) {
         detailDoneRef.current.add(title.id)
         return
       }
@@ -1649,14 +2127,16 @@ export default function App() {
       let vodId = ''
       const match = readMatch(title.id)
       const validMatch =
-        match &&
-        matchTitleName(title, match.matchedName) &&
-        (!isAnimeTitle(title) || match.sourceKey === 'anich')
-          ? match
-          : null
+        match && matchTitleName(title, match.matchedName) ? match : null
       if (validMatch) {
         sourceKey = validMatch.sourceKey
         vodId = validMatch.vodId
+        // probe 只读本地详情缓存；先把详情拉进缓存，首次探测才不会空转。
+        try {
+          await playDetail(sourceKey, vodId)
+        } catch {
+          // resolveSession/播放阶段还会再次尝试
+        }
       } else {
         const resolved = await resolveSession(title, { episodeIndex: 0 })
         sourceKey = resolved.target.sourceKey
@@ -1672,6 +2152,7 @@ export default function App() {
         probeFlightsRef.current.delete(key)
       }
     } catch (error) {
+      probeTriedRef.current.delete(title.id)
       console.info('[jj] play probe skipped', error)
     }
   }, [])
@@ -1679,10 +2160,11 @@ export default function App() {
   useEffect(() => {
     if (!detailTitle) return
     // Debounced background prefetch: search/detail/target + probe, never blocking the modal.
+    // 3s:短暂路过详情页不值得付出全源搜索的流量。
     const title = detailTitle
     const timer = window.setTimeout(() => {
       void ensureProbe(title)
-    }, 300)
+    }, 3000)
     return () => window.clearTimeout(timer)
   }, [detailTitle, ensureProbe])
 
@@ -1694,7 +2176,11 @@ export default function App() {
       .filter((title): title is Title => Boolean(title))
   }, [progressMap, registry])
 
-  const homeItems = feedItems('home')
+  const homeItems = useMemo(() => feedItems('home'), [feedItems])
+  const browseFeedItems = useMemo(
+    () => (view === 'home' ? homeItems : feedItems(view)),
+    [feedItems, homeItems, view],
+  )
 
   const heroSlides = useMemo(() => {
     const films = homeItems.filter((title) => title.mediaType === 'film')
@@ -1804,6 +2290,7 @@ export default function App() {
                   query={query.trim()}
                   results={searchResults}
                   busy={searchBusy}
+                  partialErrors={searchSourceErrors}
                   myList={myList}
                   progressFor={progressFor}
                   onOpen={openDetail}
@@ -1830,27 +2317,21 @@ export default function App() {
                 <BrowseView
                   view={view}
                   feed={feeds[view] ?? emptyFeed}
-                  feedItems={feedItems(view)}
+                  feedItems={browseFeedItems}
                   resolveTitle={resolveTitle}
                   recentItems={recentItems}
-                  sourceNames={sourceNames}
+                  sources={sourceInfos}
                   feedExhausted={Boolean(feedExhaustedMap[view])}
                   autoplayNext={autoplayNext}
                   onToggleAutoplay={() => setAutoplayNext((value) => !value)}
-                  danmakuOn={danmakuOn}
-                  onToggleDanmaku={() => setDanmakuOn((value) => !value)}
-                  networkProxy={networkProxy}
-                  onSaveProxy={(value) => setNetworkProxy(value)}
                   myList={myList}
                   later={later}
-                  downloads={downloads}
                   progressFor={progressFor}
-                  onLoadMore={() => void loadFeedNext(view)}
+                  onLoadMore={loadMoreForView}
                   onNavigate={handleNavigate}
                   onOpen={openDetail}
                   onPlay={startWatch}
                   onToggleList={toggleList}
-                  onToggleDownload={toggleDownload}
                   onRetry={() => void loadFeed(view, true)}
                   onRegister={register}
                 />
@@ -1867,45 +2348,47 @@ export default function App() {
           related={related}
           inList={myList.includes(detailTitle.id)}
           inLater={later.includes(detailTitle.id)}
-          inDownloads={downloads.includes(detailTitle.id)}
           liked={liked.includes(detailTitle.id)}
           progress={progressFor(detailTitle.id)}
           onClose={() => setDetailId(null)}
           onPlay={startWatch}
           onToggleList={toggleList}
           onToggleLater={toggleLater}
-          onToggleDownload={toggleDownload}
           onToggleLike={toggleLike}
           onOpenRelated={setDetailId}
         />
       )}
 
       {playback && playingTitle && (
-        <Theater
-          title={playingTitle}
-          playback={playback}
-          probe={playbackProbe}
-          sourceName={playback.sourceKey ? sourceNames[playback.sourceKey] : undefined}
-          expectedDuration={playbackProbeLine?.durationSec}
-          onClose={closePlayback}
-          onProgress={handlePlaybackProgress}
-          onLiveTime={handlePlaybackLiveTime}
-          onFirstFrame={handlePlaybackFirstFrame}
-          onStatus={handlePlaybackStatus}
-          onMediaError={handleMediaError}
-          onShortBuffer={handleShortBuffer}
-          onRebufferSwitch={handleRebufferSwitch}
-          onSingleStall={handleSingleStall}
-          onStartupActivity={handleStartupActivity}
-          onRetry={retryPlayback}
-          onSwitchLine={switchLine}
-          onSwitchSource={switchSource}
-          onPlayEpisode={(episode) => startWatch(playingTitle.id, episode)}
-          onSelectSourceEpisode={selectSourceEpisode}
-          danmakuOn={danmakuOn}
-          onToggleDanmaku={() => setDanmakuOn((value) => !value)}
-          onEnded={handlePlaybackEnded}
-        />
+        <Suspense fallback={null}>
+          <Theater
+            title={playingTitle}
+            playback={playback}
+            probe={playbackProbe}
+            sourceName={playback.sourceKey ? sourceNames[playback.sourceKey] : undefined}
+            allLines={aggregateLines}
+            expectedDuration={
+              playingTitle?.mediaType === 'film' ? playbackProbeLine?.durationSec : undefined
+            }
+            onClose={closePlayback}
+            onProgress={handlePlaybackProgress}
+            onLiveTime={handlePlaybackLiveTime}
+            onFirstFrame={handlePlaybackFirstFrame}
+            onStatus={handlePlaybackStatus}
+            onMediaError={handleMediaError}
+            onShortBuffer={handleShortBuffer}
+            onRebufferSwitch={handleRebufferSwitch}
+            onSingleStall={handleSingleStall}
+            onStartupActivity={handleStartupActivity}
+            onRetry={retryPlayback}
+            onSwitchLine={switchLine}
+            onSwitchToLine={switchToLine}
+            onSwitchSource={switchSource}
+            onPlayEpisode={(episode) => startWatch(playingTitle.id, episode)}
+            onSelectSourceEpisode={selectSourceEpisode}
+            onEnded={handlePlaybackEnded}
+          />
+        </Suspense>
       )}
 
       {toast && (
@@ -1916,6 +2399,39 @@ export default function App() {
           {toast.message}
         </div>
       )}
+
+      <BackToTop view={view} />
     </div>
+  )
+}
+
+function BackToTop({ view }: { view: ViewKey }) {
+  const { t } = useI18n()
+  const [visible, setVisible] = useState(false)
+
+  useEffect(() => {
+    const scroller = document.querySelector('.main-scroll') as HTMLElement | null
+    if (!scroller) return
+    const update = () => setVisible(scroller.scrollTop > 360)
+    update()
+    scroller.addEventListener('scroll', update, { passive: true })
+    return () => scroller.removeEventListener('scroll', update)
+  }, [view])
+
+  if (!visible) return null
+
+  return (
+    <button
+      type="button"
+      className="back-to-top"
+      aria-label={t('common.backToTop')}
+      title={t('common.backToTop')}
+      onClick={() => {
+        const scroller = document.querySelector('.main-scroll')
+        if (scroller) scroller.scrollTo({ top: 0, behavior: 'smooth' })
+      }}
+    >
+      <ArrowUp size={18} strokeWidth={2.2} aria-hidden />
+    </button>
   )
 }

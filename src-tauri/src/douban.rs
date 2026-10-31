@@ -24,12 +24,36 @@ fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .use_native_tls()
             .user_agent(UA)
             .timeout(TIMEOUT)
             .connect_timeout(Duration::from_secs(5))
             .cookie_store(true)
             .build()
             .expect("failed to build http client")
+    })
+}
+
+fn image_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(UA)
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .dns_resolver(std::sync::Arc::new(crate::play_proxy::PublicDnsResolver))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 3 {
+                    return attempt.error("too many redirects");
+                }
+                let host = attempt.url().host_str().unwrap_or_default();
+                if host != "doubanio.com" && !host.ends_with(".doubanio.com") {
+                    return attempt.error("blocked redirect host");
+                }
+                attempt.follow()
+            }))
+            .build()
+            .expect("failed to build image http client")
     })
 }
 
@@ -57,8 +81,19 @@ fn cache_get(key: &str) -> Option<String> {
 
 fn cache_put(key: String, body: String, ttl: Duration) {
     if let Ok(mut map) = cache().lock() {
-        if map.len() > 512 {
-            map.retain(|_, entry| entry.expires > Instant::now());
+        if map.len() >= 512 {
+            let now = Instant::now();
+            map.retain(|_, entry| entry.expires > now);
+            while map.len() >= 512 {
+                let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                map.remove(&oldest);
+            }
         }
         map.insert(
             key,
@@ -148,6 +183,7 @@ async fn fetch_json(
 struct RawSubject {
     id: String,
     title: String,
+    #[serde(default)]
     cover: String,
     #[serde(default)]
     rate: String,
@@ -672,7 +708,7 @@ pub async fn fetch_image(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     if !host_allowed {
         return image_error(400, "only doubanio.com images are allowed");
     }
-    let attempt = client()
+    let attempt = image_client()
         .get(parsed)
         .header(header::REFERER, IMG_REFERER)
         .timeout(Duration::from_secs(15))

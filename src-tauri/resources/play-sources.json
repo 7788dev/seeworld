@@ -1,17 +1,7 @@
 {
-  "_comment": "播放源配置。active: dyttzy/ffzy(核心直连源)+ lzi/bfzy/jyzy/piaoling2(备用池,扩大自动换源候选;lzi/bfzy 的 ppvod/adjump 广告由 adFilter=safe 内置过滤)。jszy 保持禁用(封皮与资源错配,错片硬伤)。anich 为 AniCh 聚合动漫源(多线路自动测速选优 + 弹幕)。用户可用 %APPDATA%/com.jianjie.desktop/play-sources.json 覆盖(replace=true)。",
+  "_comment": "播放源配置。active: dyttzy/ffzy(核心直连源)+ lzi/bfzy/jyzy/piaoling2(备用池,扩大自动换源候选;lzi/bfzy 的 ppvod/adjump 广告由 adFilter=safe 内置过滤)。jszy 保持禁用(封皮与资源错配,错片硬伤)。用户可用 %APPDATA%/com.jianjie.desktop/play-sources.json 覆盖(replace=true)。",
   "version": 2,
   "sources": [
-    {
-      "key": "anich",
-      "name": "AniCh聚合动漫",
-      "type": "anich",
-      "api": "https://api.emmmm.eu.org",
-      "enabled": true,
-      "priority": 95,
-      "alwaysProxy": true,
-      "adFilter": "off"
-    },
     {
       "key": "dyttzy",
       "name": "电影天堂",

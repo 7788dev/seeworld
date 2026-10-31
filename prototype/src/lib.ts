@@ -17,11 +17,17 @@ export const parseRuntime = (value?: string) => {
   return Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60
 }
 
-export function usePersistentState<T>(key: string, initial: T) {
+export function usePersistentState<T>(
+  key: string,
+  initial: T,
+  normalize?: (value: unknown) => T,
+) {
   const [value, setValue] = useState<T>(() => {
     try {
       const stored = localStorage.getItem(key)
-      return stored ? (JSON.parse(stored) as T) : initial
+      if (!stored) return initial
+      const parsed: unknown = JSON.parse(stored)
+      return normalize ? normalize(parsed) : (parsed as T)
     } catch {
       return initial
     }

@@ -734,6 +734,15 @@ input {
   letter-spacing: 0.2em;
 }
 
+.card-brand .card-source {
+  padding: 1px 5px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: #aab0a2;
+  font-size: 7.5px;
+  letter-spacing: 0.12em;
+}
+
 .n-mark {
   font-family: 'Anton', 'Arial Narrow', sans-serif;
   font-size: 17px;
@@ -1247,6 +1256,15 @@ input {
   line-height: 1.6;
 }
 
+.search-partial {
+  margin: 0 0 14px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  background: rgba(179, 146, 80, 0.12);
+  color: #cdb98c;
+  font-size: 11px;
+}
+
 .page-head-aside {
   flex-shrink: 0;
   padding-bottom: 2px;
@@ -1352,223 +1370,16 @@ input {
   line-height: 1.65;
 }
 
-/* ------------------------------- downloads ------------------------------ */
-
-.storage-card {
-  width: 300px;
-  padding: 13px 15px;
-  border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.04);
-  backdrop-filter: blur(12px);
-}
-
-.storage-top {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-}
-
-.storage-icon {
-  width: 34px;
-  height: 34px;
-  flex-shrink: 0;
-  display: grid;
-  place-items: center;
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  color: #c3c9bd;
-}
-
-.storage-top > div {
-  flex: 1;
-  min-width: 0;
-}
-
-.storage-top strong {
-  color: #ecEEE8;
-  font-size: 11.5px;
-  font-weight: 650;
-}
-
-.storage-top strong span {
-  color: #8d9387;
-  font-weight: 500;
-}
-
-.storage-bar {
-  height: 4px;
-  margin-top: 8px;
-  overflow: hidden;
-  border-radius: 4px;
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.storage-bar span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #d40812, #ff6257);
-}
-
-.storage-setting {
-  margin-top: 11px;
-  padding-top: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  border-top: 1px solid rgba(255, 255, 255, 0.07);
-  color: #c3c8be;
-  font-size: 10px;
-}
-
-.storage-setting em {
-  display: block;
-  max-width: 190px;
-  margin-top: 2px;
-  color: #7f857a;
-  font-size: 8.5px;
-  font-style: normal;
-  line-height: 1.4;
-}
-
-.download-list {
-  border-top: 1px solid rgba(255, 255, 255, 0.07);
-}
-
-.download-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-}
-
-.download-main {
-  flex: 1;
-  min-width: 0;
-  padding: 13px 4px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  text-align: left;
-}
-
-.download-thumb {
-  position: relative;
-  width: 92px;
-  aspect-ratio: 16 / 10;
-  flex-shrink: 0;
-  overflow: hidden;
-  border-radius: 9px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.download-thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.download-thumb-play {
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(180deg, transparent 50%, rgba(0, 0, 0, 0.35));
-}
-
-.download-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.download-copy strong {
-  color: #f0f2ec;
-  font-size: 13.5px;
-  font-weight: 650;
-}
-
-.download-copy > span {
-  color: #969c90;
-  font-size: 10px;
-}
-
-.download-copy .download-status {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  color: #7dcf8b;
-  font-size: 9.5px;
-}
-
-.download-status em {
-  color: #8b9186;
-  font-style: normal;
-}
-
-.download-size {
-  margin-left: auto;
-  padding-left: 18px;
-  color: #a0a699;
-  font-size: 10px;
-  white-space: nowrap;
-}
-
-.download-remove {
-  width: 34px;
-  height: 34px;
-  margin-right: 6px;
-  flex-shrink: 0;
-  display: grid;
-  place-items: center;
-  border-radius: 50%;
-  color: #969c90;
-  transition: background 0.16s ease, color 0.16s ease;
-}
-
-.download-remove:hover {
-  background: rgba(229, 9, 20, 0.15);
-  color: #ffd9d7;
-}
-
 /* --------------------------------- toggle ------------------------------- */
-
-.toggle {
-  position: relative;
-  width: 38px;
-  height: 21px;
-  flex-shrink: 0;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.15);
-  transition: background 0.22s ease;
-}
-
-.toggle span {
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 15px;
-  height: 15px;
-  border-radius: 50%;
-  background: #d2d7cc;
-  transition: transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.2s ease;
-}
-
-.toggle.is-on {
-  background: rgba(229, 9, 20, 0.82);
-}
-
-.toggle.is-on span {
-  transform: translateX(17px);
-  background: #fff;
-}
 
 /* -------------------------------- account ------------------------------- */
 
 .page-view--settings .page-head,
-.page-view--settings .account-grid {
+.page-view--settings .account-playback {
+  grid-column: 1 / -1;
+}
+
+.account-grid {
   max-width: 1040px;
   margin-left: auto;
   margin-right: auto;
@@ -2767,10 +2578,6 @@ html[lang='zh-CN'] .page-count {
   transform: scale(0.9);
 }
 
-.dock-danmaku.is-active {
-  color: var(--red);
-}
-
 .dock-play {
   width: 45px;
   height: 45px;
@@ -3318,6 +3125,8 @@ html[lang='zh-CN'] .page-count {
   gap: 6px;
   overflow-x: auto;
   scrollbar-width: none;
+  user-select: none;
+  overscroll-behavior-x: contain;
 }
 
 .line-tabs::-webkit-scrollbar {
@@ -3437,10 +3246,6 @@ html[lang='zh-CN'] .page-count {
 
   .poster-card--continue .card-title--lg {
     font-size: 23px;
-  }
-
-  .storage-card {
-    width: 270px;
   }
 }
 
@@ -3570,10 +3375,6 @@ html[lang='zh-CN'] .page-count {
     align-items: flex-start;
     gap: 16px;
     padding-top: 18px;
-  }
-
-  .storage-card {
-    width: 100%;
   }
 
   .page-head-aside {
@@ -3746,26 +3547,6 @@ html[lang='zh-CN'] .page-count {
 
   .account-stats {
     gap: 22px;
-  }
-
-  .download-main {
-    gap: 12px;
-  }
-
-  .download-thumb {
-    width: 68px;
-  }
-
-  .download-size {
-    display: none;
-  }
-
-  .download-copy strong {
-    font-size: 12px;
-  }
-
-  .download-copy > span {
-    font-size: 9px;
   }
 
   .modal-layer {
@@ -4792,40 +4573,6 @@ html.is-window-maximized {
 .account-about .settings-version {
   margin-top: 0;
   flex-shrink: 0;
-}
-
-.proxy-field {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.proxy-input {
-  flex: 1;
-  min-width: 0;
-  height: 38px;
-  padding: 0 12px;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.06);
-  color: #eef1e9;
-  font-size: 11px;
-  outline: none;
-  transition: border-color 0.16s ease, background 0.16s ease;
-}
-
-.proxy-input::placeholder {
-  color: #6f766b;
-}
-
-.proxy-input:focus {
-  border-color: rgba(229, 9, 20, 0.5);
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.proxy-field .btn {
-  flex-shrink: 0;
-  height: 38px;
 }
 
 /* ---- Infinite feed sentinel ---- */

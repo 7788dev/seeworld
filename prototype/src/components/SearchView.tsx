@@ -8,6 +8,7 @@ interface SearchViewProps {
   query: string
   results: Title[]
   busy: boolean
+  partialErrors: number
   myList: string[]
   progressFor: (id: string) => PlaybackProgress | undefined
   onOpen: (id: string) => void
@@ -20,6 +21,7 @@ export default function SearchView({
   query,
   results,
   busy,
+  partialErrors,
   myList,
   progressFor,
   onOpen,
@@ -30,7 +32,7 @@ export default function SearchView({
   const { t } = useI18n()
 
   return (
-    <div className="page-view search-view">
+    <div className="page-view search-view" aria-busy={busy}>
       <header className="page-head">
         <div className="page-head-copy">
           <p className="eyebrow">{t('search.eyebrow')}</p>
@@ -49,6 +51,12 @@ export default function SearchView({
           {t('search.clear')}
         </button>
       </header>
+
+      {partialErrors > 0 && results.length > 0 && (
+        <p className="search-partial" role="status">
+          {t('search.partial', { count: partialErrors })}
+        </p>
+      )}
 
       {busy && results.length === 0 ? (
         <div className="feed-status" role="status">

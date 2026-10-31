@@ -1,9 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Bookmark,
   BookmarkCheck,
   Check,
-  Download,
   Play,
   Plus,
   ThumbsUp,
@@ -14,6 +13,7 @@ import {
   episodeFromLabel,
   episodeName,
   episodeSynopsis,
+  formatEpisodeLabel,
   formatRuntimeLabel,
   mediaLabel,
   seasonsLabel,
@@ -26,7 +26,15 @@ import {
 import type { Episode, Title } from '../data'
 import { useI18n } from '../i18n'
 import { isDesktopApp } from '../lib'
-import { isPlayableLine, matchTitleName, playDetail, readMatch } from '../play'
+import {
+  isPlayableEpisode,
+  isPlayableLine,
+  matchTitleName,
+  playDetail,
+  readMatch,
+  sourceFromTitleId,
+} from '../play'
+import { useFocusTrap } from '../useFocusTrap'
 import { stripHtml } from '../lib'
 import { cx, isPortraitImage, percentage } from '../lib'
 import type { PlaybackProgress } from '../types'
@@ -36,14 +44,12 @@ interface DetailModalProps {
   related: Title[]
   inList: boolean
   inLater: boolean
-  inDownloads: boolean
   liked: boolean
   progress?: PlaybackProgress
   onClose: () => void
   onPlay: (id: string, episode?: Episode) => void
   onToggleList: (id: string) => void
   onToggleLater: (id: string) => void
-  onToggleDownload: (id: string) => void
   onToggleLike: (id: string) => void
   onOpenRelated: (id: string) => void
 }
@@ -53,14 +59,12 @@ export default function DetailModal({
   related,
   inList,
   inLater,
-  inDownloads,
   liked,
   progress,
   onClose,
   onPlay,
   onToggleList,
   onToggleLater,
-  onToggleDownload,
   onToggleLike,
   onOpenRelated,
 }: DetailModalProps) {
@@ -69,51 +73,54 @@ export default function DetailModal({
   // 真实源站数据:详情打开后用播放源的实际内容增强(每集真实名称、真实简介)。
   // ps- 前缀是搜索结果直接命中的源站条目,按 id 还原 sourceKey/vodId。
   const [sourceEpisodeNames, setSourceEpisodeNames] = useState<string[]>([])
-  const [resolvedTitle, setResolvedTitle] = useState(titleProp)
-  // 渲染层统一使用增强后的 title(源站数据优先)
-  const title = resolvedTitle
+  const [sourceOverride, setSourceOverride] = useState<
+    Pick<Title, 'synopsis' | 'episodes' | 'episodesCount'> | null
+  >(null)
+  const title = useMemo(
+    () => (sourceOverride ? { ...titleProp, ...sourceOverride } : titleProp),
+    [sourceOverride, titleProp],
+  )
   useEffect(() => {
-    setResolvedTitle(titleProp)
+    setSourceOverride(null)
     setSourceEpisodeNames([])
-  }, [titleProp])
+  }, [titleProp.id])
 
   useEffect(() => {
     if (!isDesktopApp) return
     let cancelled = false
     const id = titleProp.id
-    const fromSearch = id.startsWith('ps-')
-      ? (() => {
-          const parts = id.split('-')
-          return parts.length >= 3
-            ? { sourceKey: parts[1], vodId: parts.slice(2).join('-') }
-            : null
-        })()
-      : (() => {
-          const match = readMatch(id)
-          return match && matchTitleName(titleProp, match.matchedName) ? match : null
-        })()
+    const fromSearch =
+      sourceFromTitleId(id) ??
+      (() => {
+        const match = readMatch(id)
+        return match && matchTitleName(titleProp, match.matchedName) ? match : null
+      })()
     if (!fromSearch) return
     void playDetail(fromSearch.sourceKey, fromSearch.vodId)
       .then((detail) => {
         if (cancelled) return
-        const line = detail.lines.find(isPlayableLine) ?? detail.lines[0]
-        if (line && line.episodes.length > 0) {
-          setSourceEpisodeNames(line.episodes.map((episode) => episode.name))
-          // 搜索结果(ps-)没有豆瓣占位集列表:用源站剧集生成可点播的 episodes。
-          setResolvedTitle((previous) => ({
-            ...previous,
-            synopsis: stripHtml(detail.content || previous.synopsis),
-            episodes: line.episodes.map((episode, index) => ({
-              id: `${previous.id}-s1e${index + 1}`,
-              season: 1,
-              number: index + 1,
-              name: episode.name || `第${index + 1}集`,
-              runtime: '',
-              synopsis: '',
-            })),
-            episodesCount: line.episodes.length,
-          }))
-        }
+        const line = detail.lines.find(isPlayableLine)
+        if (!line || line.episodes.length === 0) return
+        const playable = line.episodes
+          .map((episode, index) => ({ episode, index }))
+          .filter(({ episode }) => isPlayableEpisode(episode))
+        if (playable.length === 0 && titleProp.mediaType === 'series') return
+        const isSeries = titleProp.mediaType === 'series'
+        setSourceEpisodeNames(isSeries ? line.episodes.map((episode) => episode.name) : [])
+        setSourceOverride({
+          synopsis: stripHtml(detail.content || titleProp.synopsis),
+          episodes: isSeries
+            ? playable.map(({ episode, index }) => ({
+                id: `${id}-s1e${index + 1}`,
+                season: 1,
+                number: index + 1,
+                name: episode.name || `第${index + 1}集`,
+                runtime: '',
+                synopsis: '',
+              }))
+            : titleProp.episodes,
+          episodesCount: isSeries ? playable.length : titleProp.episodesCount,
+        })
       })
       .catch(() => undefined)
     return () => {
@@ -121,11 +128,24 @@ export default function DetailModal({
     }
   }, [titleProp.id])
   const panelRef = useRef<HTMLElement>(null)
+  useFocusTrap(panelRef)
   const heroRef = useRef<HTMLImageElement>(null)
   const [portraitId, setPortraitId] = useState<string | null>(null)
   const portraitHero = portraitId === title.id
   const progressPct = progress ? percentage(progress.current, progress.duration) : 0
-  const initialEpisode = episodeFromLabel(title)
+  const episodes = title.episodes ?? []
+  const savedEpisode = useMemo(() => {
+    if (progress?.episodeId) {
+      const byId = episodes.find((episode) => episode.id === progress.episodeId)
+      if (byId) return byId
+    }
+    if (progress?.episodeIndex !== undefined) {
+      const index = progress.episodeIndex
+      return episodes.find((episode) => episode.number === index + 1)
+    }
+    return undefined
+  }, [episodes, progress?.episodeId, progress?.episodeIndex])
+  const initialEpisode = savedEpisode ?? episodeFromLabel(title) ?? episodes[0]
   const meta =
     title.mediaType === 'series'
       ? title.seasons
@@ -134,10 +154,16 @@ export default function DetailModal({
           ? t('douban.episodesCount', { count: title.episodesCount })
           : ''
       : formatRuntimeLabel(title.duration, language)
-  const episodes = title.episodes ?? []
   const localizedName = titleName(title, language)
   const separator = language === 'zh' ? '、' : ', '
-  const progressLabel = titleEpisodeLabel(title, language) ?? t('detail.continueWatching')
+  const progressLabel = initialEpisode
+    ? formatEpisodeLabel(
+        initialEpisode.season,
+        initialEpisode.number,
+        episodeName(initialEpisode, language),
+        language,
+      )
+    : (titleEpisodeLabel(title, language) ?? t('detail.continueWatching'))
   const ratingLabel =
     title.doubanRating !== undefined
       ? t('douban.ratingBadge', { rating: title.doubanRating.toFixed(1) })
@@ -145,10 +171,6 @@ export default function DetailModal({
         ? t('match.label', { percent: title.match })
         : ''
   const synopsisText = titleSynopsis(title, language)
-
-  useEffect(() => {
-    panelRef.current?.focus()
-  }, [])
 
   useEffect(() => {
     const image = heroRef.current
@@ -238,15 +260,6 @@ export default function DetailModal({
               onClick={() => onToggleLater(title.id)}
             >
               {inLater ? <BookmarkCheck size={18} /> : <Bookmark size={18} />}
-            </button>
-            <button
-              type="button"
-              className={cx('round-action', inDownloads && 'is-on')}
-              aria-label={inDownloads ? t('detail.removeDownload') : t('detail.download')}
-              title={inDownloads ? t('detail.removeDownload') : t('detail.download')}
-              onClick={() => onToggleDownload(title.id)}
-            >
-              {inDownloads ? <Check size={18} /> : <Download size={18} />}
             </button>
             <button
               type="button"

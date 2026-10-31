@@ -1,6 +1,7 @@
 import { ChevronDown, RotateCcw } from 'lucide-react'
 import type { ExploreSort, ExploreValues } from '../douban'
 import type { FilterConfig } from '../filters'
+import { filterLabel } from '../filters'
 import { useI18n } from '../i18n'
 
 interface FilterBarProps {
@@ -51,11 +52,11 @@ export default function FilterBar({
   onChange,
   onReset,
 }: FilterBarProps) {
-  const { t } = useI18n()
+  const { language, t } = useI18n()
   const all = t('filter.all')
   const withAll = (options: string[]): SelectOption[] => [
     { value: '', label: all },
-    ...options.map((option) => ({ value: option, label: option })),
+    ...options.map((option) => ({ value: option, label: filterLabel(option, language) })),
   ]
   const ratingOptions: SelectOption[] = [
     { value: '0', label: t('filter.ratingAny') },

@@ -1,6 +1,6 @@
 import type { ViewKey } from './data'
 import type { ExploreSort, ExploreValues } from './douban'
-import type { MessageKey } from './i18n'
+import type { Language, MessageKey } from './i18n'
 
 export interface FilterConfig {
   forms?: { value: string; labelKey: MessageKey }[]
@@ -121,6 +121,65 @@ const ANIME_GENRES = [
 ]
 
 const NEW_GENRES = Array.from(new Set([...MOVIE_GENRES, ...TV_GENRES]))
+
+const FILTER_LABEL_EN: Record<string, string> = {
+  喜剧: 'Comedy',
+  爱情: 'Romance',
+  动作: 'Action',
+  科幻: 'Sci-Fi',
+  动画: 'Animation',
+  悬疑: 'Mystery',
+  犯罪: 'Crime',
+  惊悚: 'Thriller',
+  冒险: 'Adventure',
+  音乐: 'Music',
+  历史: 'History',
+  奇幻: 'Fantasy',
+  恐怖: 'Horror',
+  战争: 'War',
+  传记: 'Biography',
+  歌舞: 'Musical',
+  武侠: 'Wuxia',
+  灾难: 'Disaster',
+  西部: 'Western',
+  纪录片: 'Documentary',
+  短片: 'Short',
+  古装: 'Period',
+  家庭: 'Family',
+  剧情: 'Drama',
+  华语: 'Chinese',
+  欧美: 'Western',
+  韩国: 'South Korea',
+  日本: 'Japan',
+  中国大陆: 'Mainland China',
+  美国: 'United States',
+  中国香港: 'Hong Kong',
+  中国台湾: 'Taiwan',
+  英国: 'UK',
+  法国: 'France',
+  德国: 'Germany',
+  意大利: 'Italy',
+  西班牙: 'Spain',
+  印度: 'India',
+  泰国: 'Thailand',
+  俄罗斯: 'Russia',
+  加拿大: 'Canada',
+  澳大利亚: 'Australia',
+  爱尔兰: 'Ireland',
+  瑞典: 'Sweden',
+  巴西: 'Brazil',
+  丹麦: 'Denmark',
+  '2010年代': '2010s',
+  '2000年代': '2000s',
+  '90年代': "'90s",
+  '80年代': "'80s",
+  '70年代': "'70s",
+  '60年代': "'60s",
+  更早: 'Earlier',
+}
+
+export const filterLabel = (value: string, language: Language) =>
+  language === 'zh' ? value : (FILTER_LABEL_EN[value] ?? value)
 
 const SORTS: FilterConfig['sorts'] = [
   { value: 'T', labelKey: 'filter.sortRecommend' },

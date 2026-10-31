@@ -11,7 +11,7 @@ tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
 tauri = { version = "2.12.5", features = [] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "cookies", "charset", "http2", "rustls-tls", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "cookies", "charset", "http2", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 urlencoding = "2"

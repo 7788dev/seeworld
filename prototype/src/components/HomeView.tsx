@@ -51,10 +51,26 @@ export default function HomeView({
   if (!featured) {
     return (
       <div className="home-view">
-        <div className="feed-status" role="status">
-          <Loader2 className="feed-spinner" size={20} aria-hidden />
-          {t('common.loading')}
-        </div>
+        {feed.loading ? (
+          <div className="feed-status" role="status">
+            <Loader2 className="feed-spinner" size={20} aria-hidden />
+            {t('common.loading')}
+          </div>
+        ) : feed.error ? (
+          <div className="feed-status feed-status--warn">
+            <span>{t('common.loadFailed')}</span>
+            <button type="button" className="btn btn--glass btn--small" onClick={onRetry}>
+              <RefreshCw size={13} aria-hidden /> {t('common.retry')}
+            </button>
+          </div>
+        ) : (
+          <div className="feed-status" role="status">
+            <span>{t('common.emptyNow')}</span>
+            <button type="button" className="btn btn--glass btn--small" onClick={onRetry}>
+              <RefreshCw size={13} aria-hidden /> {t('common.retry')}
+            </button>
+          </div>
+        )}
       </div>
     )
   }

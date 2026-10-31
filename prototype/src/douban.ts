@@ -146,6 +146,34 @@ export const dbHeroImg = (url: string) =>
 export const dbStillImg = (url: string) =>
   dbImg(unwrapDbImg(url).replace('/photo/m/public/', '/photo/l/public/'))
 
+// 播放源常用豆瓣图床；只有 doubanio 域名能走 dbimg 代理，其他域名保持原直链。
+export const sourcePoster = (url: string) => {
+  if (!url) return ''
+  const raw = unwrapDbImg(url)
+  const absolute = raw.startsWith('//') ? `https:${raw}` : raw
+  try {
+    const host = new URL(absolute).hostname
+    if (host === 'doubanio.com' || host.endsWith('.doubanio.com')) return dbCardImg(absolute)
+  } catch {
+    // keep the original URL when it is not parseable
+  }
+  return absolute
+}
+
+export const placeholderEpisodes = (
+  baseId: string,
+  count: number,
+  runtime = '45m',
+): Episode[] =>
+  Array.from({ length: Math.min(Math.max(0, count), 200) }, (_, index) => ({
+    id: `${baseId}-s1e${index + 1}`,
+    season: 1,
+    number: index + 1,
+    name: `E${index + 1}`,
+    runtime,
+    synopsis: '',
+  }))
+
 const rateToNumber = (rate: string) => {
   const value = Number.parseFloat(rate)
   return Number.isFinite(value) && value > 0 ? value : undefined
@@ -216,6 +244,7 @@ export const subjectToTitle = (subject: DbSubject, kind: 'tv' | 'movie'): Title 
     cast: [],
     isNew: subject.isNew,
     addedOrder: 0,
+    episodesCount: episodeCountFrom(subject.episodesInfo),
   }
 }
 
@@ -231,7 +260,7 @@ export const suggestToTitle = (item: DbSuggest): Title => {
     year: Number.isFinite(year) ? year : 0,
     ageRating: '',
     match: rating,
-    originalName: item.subTitle || undefined,
+    // suggest 的 sub_title 是"类型/年份"元信息而非原名,写进去会污染名称匹配与去重。
     genres: [],
     synopsis: '',
     poster: dbCardImg(item.img),
@@ -307,7 +336,11 @@ export const exploreRequests = (
   const anime = view === 'anime' || values.form === 'anime'
   const tags = anime ? ['动画', ...baseTags] : baseTags
   if (view === 'movies') return [{ endpoint: 'movie', tags }]
-  if (view === 'tv') return [{ endpoint: 'tv', tags }]
+  if (view === 'tv') {
+    // 通用 tag 接口没有独立的“剧集/综艺”布尔参数；综艺通过类型 tag 表达。
+    const tvTags = values.form === 'variety' ? ['综艺', ...baseTags] : baseTags
+    return [{ endpoint: 'tv', tags: tvTags }]
+  }
   if (view === 'anime') {
     if (values.form === 'series') return [{ endpoint: 'tv', tags }]
     if (values.form === 'film') return [{ endpoint: 'movie', tags }]
@@ -361,14 +394,7 @@ export const applyDetail = (base: Title, detail: DbDetail): Title => {
   const heroSource = detail.picLarge || detail.picNormal || base.hero || ''
   const episodes: Episode[] =
     mediaType === 'series' && detail.episodesCount > 0
-      ? Array.from({ length: Math.min(detail.episodesCount, 40) }, (_, index) => ({
-          id: `${base.id}-s1e${index + 1}`,
-          season: 1,
-          number: index + 1,
-          name: `E${index + 1}`,
-          runtime: duration ?? '45m',
-          synopsis: '',
-        }))
+      ? placeholderEpisodes(base.id, detail.episodesCount, duration ?? '45m')
       : (base.episodes ?? [])
   const year = Number.parseInt(detail.year, 10)
   return {

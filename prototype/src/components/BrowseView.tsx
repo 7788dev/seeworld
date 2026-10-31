@@ -1,33 +1,24 @@
 import {
-  ArrowUp,
   Bookmark,
   Check,
   Clock3,
-  Download,
   Globe2,
-  HardDrive,
   Info,
   ListPlus,
   Loader2,
   RefreshCw,
   SearchX,
   Settings,
-  Trash2,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import {
-  formatRuntimeLabel,
-  seasonsLabel,
-  titleGenres,
-  titleName,
-} from '../content'
 import type { Title, ViewKey } from '../data'
 import { fetchExploreTitles } from '../douban'
 import type { ExploreValues, FeedState } from '../douban'
 import { filterConfigFor, isFilterActive, sanitizeFilters } from '../filters'
 import { useI18n } from '../i18n'
-import { cx, isDesktopApp, percentage, usePersistentState } from '../lib'
+import { cx, isDesktopApp, usePersistentState } from '../lib'
+import type { PlaySourceInfo } from '../play'
 import type { PlaybackProgress } from '../types'
 import FilterBar from './FilterBar'
 import TitleCard from './TitleCard'
@@ -38,24 +29,18 @@ interface BrowseViewProps {
   feedItems: Title[]
   resolveTitle: (id: string) => Title | undefined
   recentItems: Title[]
-  sourceNames: Record<string, string>
+  sources: PlaySourceInfo[]
   feedExhausted: boolean
   myList: string[]
   later: string[]
-  downloads: string[]
   progressFor: (id: string) => PlaybackProgress | undefined
-  onLoadMore: () => void
+  onLoadMore: () => Promise<boolean>
   autoplayNext: boolean
   onToggleAutoplay: () => void
-  danmakuOn: boolean
-  onToggleDanmaku: () => void
-  networkProxy: string
-  onSaveProxy: (value: string) => void
   onNavigate: (view: ViewKey) => void
   onOpen: (id: string) => void
   onPlay: (id: string) => void
   onToggleList: (id: string) => void
-  onToggleDownload: (id: string) => void
   onRetry: () => void
   onRegister: (titles: Title[]) => void
 }
@@ -156,179 +141,17 @@ function EmptyState({
   )
 }
 
-function Toggle({
-  checked,
-  label,
-  onChange,
-}: {
-  checked: boolean
-  label: string
-  onChange: (next: boolean) => void
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      className={cx('toggle', checked && 'is-on')}
-      onClick={() => onChange(!checked)}
-    >
-      <span />
-    </button>
-  )
-}
-
-function DownloadsPanel({
-  downloads,
-  resolveTitle,
-  onOpen,
-  onToggleDownload,
-  onNavigate,
-  progressFor,
-}: {
-  downloads: string[]
-  resolveTitle: (id: string) => Title | undefined
-  onOpen: (id: string) => void
-  onToggleDownload: (id: string) => void
-  onNavigate: (view: ViewKey) => void
-  progressFor: (id: string) => PlaybackProgress | undefined
-}) {
-  const { language, t } = useI18n()
-  const [smartDownloads, setSmartDownloads] = usePersistentState('jj-smart-downloads', true)
-  const downloaded = byIds(downloads, resolveTitle)
-  const sizeOf = (title: Title) => 0.6 + (title.name.length % 7) * 0.3
-  const used = downloaded.reduce((total, title) => total + sizeOf(title), 0)
-  const capacity = 8
-  const usedPct = percentage(used, capacity)
-
-  return (
-    <>
-      <PageHeader
-        eyebrow={t('view.downloads.eyebrow')}
-        title={t('view.downloads.title')}
-        subtitle={t('view.downloads.subtitle')}
-        aside={
-          <div className="storage-card">
-            <div className="storage-top">
-              <span className="storage-icon">
-                <HardDrive size={17} />
-              </span>
-              <div>
-                <strong>
-                  {t('downloads.usage', { used: used.toFixed(1), capacity })}
-                </strong>
-                <div className="storage-bar">
-                  <span style={{ width: `${usedPct}%` }} />
-                </div>
-              </div>
-            </div>
-            <div className="storage-setting">
-              <span>
-                {t('downloads.smart')}
-                <em>{t('downloads.smartDesc')}</em>
-              </span>
-              <Toggle
-                checked={smartDownloads}
-                label={t('downloads.smart')}
-                onChange={setSmartDownloads}
-              />
-            </div>
-          </div>
-        }
-      />
-
-      {downloaded.length === 0 ? (
-        <EmptyState
-          icon={<Download size={26} />}
-          title={t('downloads.emptyTitle')}
-          copy={t('downloads.emptyCopy')}
-          actionLabel={t('downloads.browseMovies')}
-          onAction={() => onNavigate('movies')}
-        />
-      ) : (
-        <div className="download-list">
-          {downloaded.map((title) => {
-            const progress = progressFor(title.id)
-            const name = titleName(title, language)
-            return (
-              <div className="download-row" key={title.id}>
-                <button
-                  type="button"
-                  className="download-main"
-                  onClick={() => onOpen(title.id)}
-                  aria-label={t('downloads.open', { name })}
-                >
-                  <span className="download-thumb">
-                    <img src={title.poster} alt="" />
-                    <span className="download-thumb-play" aria-hidden />
-                  </span>
-                  <span className="download-copy">
-                    <strong>{name}</strong>
-                    <span>
-                      {title.mediaType === 'series'
-                        ? title.seasons
-                          ? seasonsLabel(title, language)
-                          : title.episodesCount
-                            ? t('douban.episodesCount', { count: title.episodesCount })
-                            : t('media.series')
-                        : formatRuntimeLabel(title.duration, language)}{' '}
-                      · {titleGenres(title, language).join(' · ')}
-                    </span>
-                    <span className="download-status">
-                      <Check size={12} aria-hidden /> {t('downloads.status')}
-                      {progress && progress.current > 0 && (
-                        <em>
-                          {' '}
-                          ·{' '}
-                          {t('downloads.watched', {
-                            percent: Math.round(
-                              percentage(progress.current, progress.duration),
-                            ),
-                          })}
-                        </em>
-                      )}
-                    </span>
-                  </span>
-                  <span className="download-size">{sizeOf(title).toFixed(1)} GB</span>
-                </button>
-                <button
-                  type="button"
-                  className="download-remove"
-                  aria-label={t('downloads.remove', { name })}
-                  onClick={() => onToggleDownload(title.id)}
-                >
-                  <Trash2 size={16} />
-                </button>
-              </div>
-            )
-          })}
-        </div>
-      )}
-    </>
-  )
-}
-
 function SettingsPanel({
-  sourceNames,
+  sources,
   autoplayNext,
   onToggleAutoplay,
-  danmakuOn,
-  onToggleDanmaku,
-  networkProxy,
-  onSaveProxy,
 }: {
-  sourceNames: Record<string, string>
+  sources: PlaySourceInfo[]
   autoplayNext: boolean
   onToggleAutoplay: () => void
-  danmakuOn: boolean
-  onToggleDanmaku: () => void
-  networkProxy: string
-  onSaveProxy: (value: string) => void
 }) {
   const { language, setLanguage, t } = useI18n()
   const [version, setVersion] = useState('')
-  const sources = Object.entries(sourceNames)
 
   useEffect(() => {
     if (!isDesktopApp) return
@@ -383,7 +206,7 @@ function SettingsPanel({
           </div>
         </section>
 
-        <section className="account-card">
+        <section className="account-card account-playback">
           <div className="account-language-intro">
             <span className="account-language-icon">
               <Settings size={18} aria-hidden />
@@ -408,34 +231,7 @@ function SettingsPanel({
                 {autoplayNext ? t('settings.on') : t('settings.off')}
               </span>
             </button>
-            <button
-              type="button"
-              className={cx('settings-toggle', danmakuOn && 'is-active')}
-              aria-pressed={danmakuOn}
-              onClick={onToggleDanmaku}
-            >
-              <span className="settings-toggle-copy">
-                <strong>{t('settings.danmaku')}</strong>
-                <em>{t('settings.danmakuDesc')}</em>
-              </span>
-              <span className="settings-toggle-state">
-                {danmakuOn ? t('settings.on') : t('settings.off')}
-              </span>
-            </button>
           </div>
-        </section>
-
-        <section className="account-card">
-          <div className="account-language-intro">
-            <span className="account-language-icon">
-              <Globe2 size={18} aria-hidden />
-            </span>
-            <div>
-              <h2>{t('settings.proxy')}</h2>
-              <p>{t('settings.proxyDesc')}</p>
-            </div>
-          </div>
-          <ProxyField initial={networkProxy} onSave={onSaveProxy} />
         </section>
 
         <section className="account-card account-sources">
@@ -450,10 +246,12 @@ function SettingsPanel({
           </div>
           {sources.length > 0 ? (
             <ul className="settings-sources">
-              {sources.map(([key, name]) => (
-                <li key={key}>
-                  <span>{name}</span>
-                  <em>{key}</em>
+              {sources.map((source) => (
+                <li key={source.key}>
+                  <span>{source.name}</span>
+                  <em>
+                    {source.key} · {source.enabled ? t('settings.on') : t('settings.off')}
+                  </em>
                 </li>
               ))}
             </ul>
@@ -474,59 +272,24 @@ function SettingsPanel({
   )
 }
 
-function ProxyField({ initial, onSave }: { initial: string; onSave: (value: string) => void }) {
-  const { t } = useI18n()
-  const [draft, setDraft] = useState(initial)
-  useEffect(() => {
-    setDraft(initial)
-  }, [initial])
-  const trimmed = draft.trim()
-  return (
-    <div className="proxy-field">
-      <input
-        type="text"
-        className="proxy-input"
-        placeholder="http://127.0.0.1:7890"
-        value={draft}
-        onChange={(event) => setDraft(event.target.value)}
-        spellCheck={false}
-      />
-      <button
-        type="button"
-        className="btn btn--glass btn--small"
-        disabled={trimmed === initial.trim()}
-        onClick={() => onSave(trimmed)}
-      >
-        {t('settings.proxySave')}
-      </button>
-    </div>
-  )
-}
-
 export default function BrowseView({
   view,
   feed,
   feedItems,
   resolveTitle,
   recentItems,
-  sourceNames,
+  sources,
   feedExhausted,
   myList,
   later,
-  downloads,
   progressFor,
   onLoadMore,
   autoplayNext,
   onToggleAutoplay,
-  danmakuOn,
-  onToggleDanmaku,
-  networkProxy,
-  onSaveProxy,
   onNavigate,
   onOpen,
   onPlay,
   onToggleList,
-  onToggleDownload,
   onRetry,
   onRegister,
 }: BrowseViewProps) {
@@ -537,6 +300,10 @@ export default function BrowseView({
   const [filterStore, setFilterStore] = usePersistentState<Record<string, ExploreValues>>(
     'jj-explore-filters',
     {},
+    (value) =>
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? (value as Record<string, ExploreValues>)
+        : {},
   )
   const filterValues = useMemo(
     () => (filterConfig ? sanitizeFilters(filterConfig, filterStore[view]) : undefined),
@@ -589,39 +356,48 @@ export default function BrowseView({
 
   // 无限瀑布流:哨兵进入视口(几何检查 + 滚动监听,不依赖 observer 触发时序)
   const sentinelRef = useRef<HTMLDivElement | null>(null)
-  const scrollerRef = useRef<HTMLElement | null>(null)
-  const [showBackToTop, setShowBackToTop] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const loadingMoreRef = useRef(false)
-  useEffect(() => {
-    const scroller = document.querySelector('.main-scroll') as HTMLElement | null
-    scrollerRef.current = scroller
-    if (!scroller) return
-    const onScroll = () => setShowBackToTop(scroller.scrollTop > 680)
-    onScroll()
-    scroller.addEventListener('scroll', onScroll, { passive: true })
-    return () => scroller.removeEventListener('scroll', onScroll)
-  }, [view])
+  const retryRef = useRef({ failures: 0, nextAt: 0 })
   useEffect(() => {
     const node = sentinelRef.current
     if (!node) return
     let cancelled = false
     const tryLoad = () => {
       if (cancelled || loadingMoreRef.current) return
+      if (Date.now() < retryRef.current.nextAt) return
       if (feed.loading || feed.error || feedExhausted || filtersActive) return
       if (feedItems.length === 0) return
       const rect = node.getBoundingClientRect()
-      if (rect.top > window.innerHeight + 600 || rect.bottom < -600) return
+      if (rect.top > window.innerHeight + 1200 || rect.bottom < -1200) return
       loadingMoreRef.current = true
       setLoadingMore(true)
-      Promise.resolve(onLoadMore())
+      onLoadMore()
+        .then((appended) => {
+          if (appended) {
+            retryRef.current = { failures: 0, nextAt: 0 }
+            return
+          }
+          const failures = retryRef.current.failures + 1
+          retryRef.current = {
+            failures,
+            nextAt: Date.now() + Math.min(60_000, 2_000 * 2 ** Math.min(failures, 5)),
+          }
+        })
+        .catch(() => {
+          const failures = retryRef.current.failures + 1
+          retryRef.current = {
+            failures,
+            nextAt: Date.now() + Math.min(60_000, 2_000 * 2 ** Math.min(failures, 5)),
+          }
+        })
         .finally(() => {
           loadingMoreRef.current = false
           setLoadingMore(false)
         })
     }
     tryLoad()
-    const observer = new IntersectionObserver(() => tryLoad(), { rootMargin: '600px 0px' })
+    const observer = new IntersectionObserver(() => tryLoad(), { rootMargin: '1200px 0px' })
     observer.observe(node)
     const scroller = node.closest('.main-scroll')
     const onScroll = () => tryLoad()
@@ -641,28 +417,9 @@ export default function BrowseView({
     return (
       <div className="page-view page-view--settings">
         <SettingsPanel
-          sourceNames={sourceNames}
+          sources={sources}
           autoplayNext={autoplayNext}
           onToggleAutoplay={onToggleAutoplay}
-          danmakuOn={danmakuOn}
-          onToggleDanmaku={onToggleDanmaku}
-          networkProxy={networkProxy}
-          onSaveProxy={onSaveProxy}
-        />
-      </div>
-    )
-  }
-
-  if (view === 'downloads') {
-    return (
-      <div className="page-view">
-        <DownloadsPanel
-          downloads={downloads}
-          resolveTitle={resolveTitle}
-          onOpen={onOpen}
-          onToggleDownload={onToggleDownload}
-          onNavigate={onNavigate}
-          progressFor={progressFor}
         />
       </div>
     )
@@ -766,7 +523,7 @@ export default function BrowseView({
             icon={<Clock3 size={26} />}
             title={t('browse.emptyRecentTitle')}
             copy={t('browse.emptyRecentCopy')}
-            actionLabel={t('browse.browseNew')}
+            actionLabel={t('nav.home')}
             onAction={() => onNavigate('home')}
           />
         ) : (
@@ -802,22 +559,17 @@ export default function BrowseView({
         </div>
       )}
 
+      {loadingMore && (
+        <div className="feed-more-status" role="status">
+          <Loader2 className="feed-spinner" size={14} aria-hidden />
+          {t('common.loadingMore')}
+        </div>
+      )}
+
       {isDoubanView && !filtersActive && !feed.loading && !feed.error && !feedExhausted && displayItems.length > 0 && (
         <div className="feed-sentinel" ref={sentinelRef} aria-hidden>
           {loadingMore && <Loader2 className="feed-spinner" size={16} aria-hidden />}
         </div>
-      )}
-
-      {showBackToTop && (
-        <button
-          type="button"
-          className="back-to-top"
-          aria-label={t('common.backToTop')}
-          title={t('common.backToTop')}
-          onClick={() => scrollerRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
-        >
-          <ArrowUp size={18} strokeWidth={2.2} aria-hidden />
-        </button>
       )}
     </div>
   )

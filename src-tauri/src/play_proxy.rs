@@ -18,38 +18,87 @@ const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 /// 大文件(MP4)按段回源:代理需要缓冲响应体,不能一次拉整部影片。
 const MAX_MEDIA_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
-fn client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent(PROXY_USER_AGENT)
-            .no_gzip()
-            .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 6 {
-                    return attempt.error("too many redirects");
+/// 连接层私网拦截:自定义 DNS resolver 在解析结果交给 hyper 之前逐 IP 校验,
+/// 关闭 ensure_public_host 之后、真实 TCP 连接之前的 DNS rebinding 窗口。
+pub(crate) struct PublicDnsResolver;
+
+impl reqwest::dns::Resolve for PublicDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(error)
+                })?;
+            let mut allowed: Vec<std::net::SocketAddr> = Vec::new();
+            for address in addrs {
+                if is_forbidden_ip(address.ip()) {
+                    return Err("blocked private ip during dns resolution".into());
                 }
-                if !matches!(attempt.url().scheme(), "http" | "https") {
-                    return attempt.error("blocked redirect scheme");
+                allowed.push(address);
+            }
+            if allowed.is_empty() {
+                return Err("dns lookup returned no address".into());
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn build_client(block_private: bool) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(PROXY_USER_AGENT)
+        .no_gzip()
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 6 {
+                return attempt.error("too many redirects");
+            }
+            if !matches!(attempt.url().scheme(), "http" | "https") {
+                return attempt.error("blocked redirect scheme");
+            }
+            if let Some(host) = attempt.url().host_str() {
+                if is_blocked_host_name(host) && block_private {
+                    return attempt.error("blocked redirect host");
                 }
-                if let Some(host) = attempt.url().host_str() {
-                    if is_blocked_host_name(host) {
-                        return attempt.error("blocked redirect host");
-                    }
-                    let bare = host.trim_start_matches('[').trim_end_matches(']');
+                let bare = host.trim_start_matches('[').trim_end_matches(']');
+                if block_private {
                     if let Ok(ip) = bare.parse::<IpAddr>() {
                         if is_forbidden_ip(ip) {
                             return attempt.error("blocked redirect ip");
                         }
                     }
-                } else {
-                    return attempt.error("redirect without host");
                 }
-                attempt.follow()
-            }))
-            .build()
-            .expect("failed to build stream proxy http client")
-    })
+            } else {
+                return attempt.error("redirect without host");
+            }
+            attempt.follow()
+        }));
+    if block_private {
+        builder = builder.dns_resolver(std::sync::Arc::new(PublicDnsResolver));
+    }
+    builder
+        .build()
+        .expect("failed to build stream proxy http client")
+}
+
+fn client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| build_client(true))
+}
+
+fn private_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| build_client(false))
+}
+
+fn client_for(source: &SourceConfig) -> &'static reqwest::Client {
+    if source.allow_private_network {
+        private_client()
+    } else {
+        client()
+    }
 }
 
 struct HostCheck {
@@ -79,6 +128,15 @@ fn host_check_put(key: String, allowed: bool) {
     let mut guard = host_checks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.len() >= 512 && !guard.contains_key(&key) {
+        if let Some(oldest) = guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.checked_at)
+            .map(|(host, _)| host.clone())
+        {
+            guard.remove(&oldest);
+        }
+    }
     guard.insert(
         key,
         HostCheck {
@@ -190,7 +248,19 @@ fn parse_proxy_uri(uri: &str) -> Option<(String, String)> {
         return None;
     };
     let rest = rest.trim_start_matches('/');
-    let (key, encoded) = rest.split_once('/')?;
+    let (key, encoded_and_query) = rest.split_once('/')?;
+    // token 挂在尾部 query(?k=...)；encoded 里的 '?' 已被编码,首个裸 '?' 即分隔符。
+    let (encoded, query) = match encoded_and_query.split_once('?') {
+        Some((encoded, query)) => (encoded, query),
+        None => (encoded_and_query, ""),
+    };
+    let token_valid = query.split('&').any(|pair| match pair.split_once('=') {
+        Some(("k", value)) => value == play::proxy_token(),
+        _ => false,
+    });
+    if !token_valid {
+        return None;
+    }
     if key.is_empty() || encoded.is_empty() {
         return None;
     }
@@ -523,6 +593,7 @@ fn block_prefix(items: &[HlsItem], indices: &[usize]) -> String {
 /// 删除 discontinuity 分块中的异常块:
 /// - 中插广告常是 4~10 秒的短块(如电影天堂 5:15 的赌场广告);
 /// - 跨 host/目录且整条列表只出现一次的块;
+///
 /// 首块/尾块始终保留,最终还会受 maxDropRatio 安全阈值约束。
 fn mark_block_ads(items: &mut [HlsItem], indices: &[usize], rules: &AdRules) {
     if !rules.drop_short_blocks && !rules.drop_unique_host_blocks {
@@ -929,7 +1000,7 @@ pub async fn handle(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u
     } else {
         Duration::from_secs(60)
     };
-    let mut builder = client()
+    let mut builder = client_for(&source)
         .request(upstream_method, upstream.clone())
         .timeout(timeout)
         .header(header::ACCEPT, "*/*");
@@ -1051,17 +1122,23 @@ mod tests {
     fn parses_proxy_uri_forms() {
         let raw = "https://cdn.example.com/hls/index.m3u8?sign=1";
         let encoded = urlencoding::encode(raw);
-        let windows = format!("http://jjstream.localhost/lzi/{encoded}");
+        let token = play::proxy_token();
+        let windows = format!("http://jjstream.localhost/lzi/{encoded}?k={token}");
         assert_eq!(
             parse_proxy_uri(&windows),
             Some(("lzi".to_string(), raw.to_string()))
         );
-        let wry = format!("jjstream://localhost/lzi/{encoded}");
+        let wry = format!("jjstream://localhost/lzi/{encoded}?k={token}");
         assert_eq!(
             parse_proxy_uri(&wry),
             Some(("lzi".to_string(), raw.to_string()))
         );
-        assert!(parse_proxy_uri("http://jjstream.localhost/lzi/file.txt").is_none());
+        assert!(parse_proxy_uri(&format!("http://jjstream.localhost/lzi/{encoded}")).is_none());
+        assert!(parse_proxy_uri(&format!(
+            "http://jjstream.localhost/lzi/{encoded}?k=wrong-token"
+        ))
+        .is_none());
+        assert!(parse_proxy_uri(&format!("http://jjstream.localhost/lzi/file.txt?k={token}")).is_none());
         assert!(parse_proxy_uri("https://example.com/lzi/x").is_none());
     }
 

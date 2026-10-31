@@ -1,4 +1,6 @@
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,7 +21,9 @@ const SEARCH_TOTAL_BUDGET: Duration = Duration::from_millis(2500);
 /// 首个可用结果到达后，再收 250ms 内已就绪的源，避免只拿到单源候选。
 const SEARCH_MERGE_WINDOW: Duration = Duration::from_millis(250);
 const PROBE_TTL: Duration = Duration::from_secs(600);
-const PROBE_LINE_TIMEOUT: Duration = Duration::from_secs(2);
+// 慢源 TTFB 普遍在 2s 以上,线路总超时必须大于 playlist 采样自身的 5s 预算,
+// 否则可播线路会被一律误判为探测失败。
+const PROBE_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_SEGMENT_BYTES: usize = 128 * 1024;
 const SEARCH_TTL: Duration = Duration::from_secs(300);
 const DETAIL_TTL: Duration = Duration::from_secs(1800);
@@ -238,6 +242,9 @@ pub struct PlayProbeResult {
     pub probed_at_ms: u64,
 }
 
+type SearchFuture =
+    BoxFuture<'static, (String, Result<Vec<PlaySearchItem>, String>)>;
+
 #[derive(Deserialize, Default)]
 struct RawVod {
     #[serde(default, deserialize_with = "flexible_string")]
@@ -332,6 +339,16 @@ fn cache_put(key: String, body: String, ttl: Duration) {
     if guard.len() >= MAX_CACHE_ENTRIES {
         let now = Instant::now();
         guard.retain(|_, entry| entry.expires > now);
+        while guard.len() >= MAX_CACHE_ENTRIES {
+            let Some(oldest) = guard
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            guard.remove(&oldest);
+        }
     }
     guard.insert(
         key,
@@ -422,6 +439,16 @@ fn probe_cache_put(key: String, result: PlayProbeResult) {
     if guard.len() >= 128 {
         let now = Instant::now();
         guard.retain(|_, entry| entry.expires > now);
+        while guard.len() >= 128 {
+            let Some(oldest) = guard
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            guard.remove(&oldest);
+        }
     }
     guard.insert(
         key,
@@ -535,9 +562,7 @@ fn validate_source(mut source: SourceConfig) -> Option<SourceConfig> {
     if source.source_type.trim().is_empty() {
         source.source_type = default_source_type();
     }
-    if !source.source_type.eq_ignore_ascii_case("cms")
-        && !source.source_type.eq_ignore_ascii_case("anich")
-    {
+    if !source.source_type.eq_ignore_ascii_case("cms") {
         eprintln!(
             "[play] skip unsupported source type {:?} ({})",
             source.source_type, source.key
@@ -584,13 +609,38 @@ pub(crate) fn api_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .use_native_tls()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(5))
+            .gzip(true)
+            .cookie_store(true)
+            .dns_resolver(std::sync::Arc::new(crate::play_proxy::PublicDnsResolver))
+            .build()
+            .expect("failed to build play http client")
+    })
+}
+
+/// 用户显式允许私网后，才使用不做私网拦截的 client（例如局域网 IPTV 源）。
+fn private_api_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .use_native_tls()
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(5))
             .gzip(true)
             .cookie_store(true)
             .build()
-            .expect("failed to build play http client")
+            .expect("failed to build private play http client")
     })
+}
+
+pub(crate) fn client_for(source: &SourceConfig) -> &'static reqwest::Client {
+    if source.allow_private_network {
+        private_api_client()
+    } else {
+        api_client()
+    }
 }
 
 fn apply_source_headers(
@@ -802,6 +852,11 @@ fn parse_play_lines(from_raw: &str, url_raw: &str) -> Vec<PlayLine> {
             .filter(|name| !name.is_empty())
             .cloned()
             .unwrap_or_else(|| format!("线路{}", index + 1));
+        // 云播线路(标记名含 "yun",如 jinyingyun)是网页跳转封装,不可直接播放,
+        // 只会以"暂不支持"干扰线路选择,在解析层直接丢弃。
+        if name.to_ascii_lowercase().contains("yun") {
+            continue;
+        }
         let episodes = urls
             .get(index)
             .map(|blob| parse_episodes(blob))
@@ -810,6 +865,11 @@ fn parse_play_lines(from_raw: &str, url_raw: &str) -> Vec<PlayLine> {
             continue;
         }
         let format = summarize_line_format(&episodes);
+        // 网页跳转线路(标记如 dytt/feifan/liangzi,分集是 share/php 页面)不可直接播放,
+        // 与云播一样只会以"暂不支持"干扰线路面板,解析层直接丢弃,只保留 m3u8/mp4 系列。
+        if format == "page" {
+            continue;
+        }
         lines.push(PlayLine {
             index: lines.len(),
             name,
@@ -847,10 +907,10 @@ fn is_playable_line(line: &PlayLine) -> bool {
 }
 
 /// None 表示自动选择第一条 hls/mp4 线路；显式选择 page/unknown 线路会返回可读错误。
-fn choose_line<'a>(
-    lines: &'a [PlayLine],
+fn choose_line(
+    lines: &[PlayLine],
     line_index: Option<usize>,
-) -> Result<&'a PlayLine, String> {
+) -> Result<&PlayLine, String> {
     if let Some(index) = line_index {
         let line = lines
             .get(index)
@@ -931,7 +991,7 @@ fn normalize_play_url(raw: &str) -> Option<String> {
 pub(crate) fn detect_format(raw: &str) -> &'static str {
     let lower = raw.to_ascii_lowercase();
     let path = lower
-        .split(|character| character == '?' || character == '#')
+        .split(['?', '#'])
         .next()
         .unwrap_or(&lower);
     if path.contains(".m3u8") {
@@ -959,11 +1019,34 @@ pub(crate) fn detect_format(raw: &str) -> &'static str {
     "unknown"
 }
 
+/// 每次启动随机生成的代理口令:jjstream 请求必须携带,防止本机任意进程借道代理。
+pub(crate) fn proxy_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let mut token = String::with_capacity(32);
+        for round in 0..4u64 {
+            // RandomState 由操作系统随机种子初始化，比时间+PID 的线性同余更不可预测。
+            let mut hasher = RandomState::new().build_hasher();
+            nanos.hash(&mut hasher);
+            pid.hash(&mut hasher);
+            round.hash(&mut hasher);
+            token.push_str(&format!("{:08x}", hasher.finish() as u32));
+        }
+        token
+    })
+}
+
 pub(crate) fn proxy_url(source_key: &str, raw_url: &str) -> String {
     format!(
-        "http://jjstream.localhost/{}/{}",
+        "http://jjstream.localhost/{}/{}?k={}",
         source_key,
-        urlencoding::encode(raw_url)
+        urlencoding::encode(raw_url),
+        proxy_token()
     )
 }
 
@@ -1021,8 +1104,8 @@ fn apply_media_headers(
 
 async fn fetch_playlist(source: &SourceConfig, url: &Url) -> Result<(String, Url, u64), String> {
     let started = Instant::now();
-    let response = apply_media_headers(api_client().get(url.clone()), source, url)
-        .timeout(Duration::from_secs(3))
+    let response = apply_media_headers(client_for(source).get(url.clone()), source, url)
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .map_err(|error| format!("播放列表请求失败：{}", error.without_url()))?;
@@ -1044,12 +1127,12 @@ async fn fetch_playlist(source: &SourceConfig, url: &Url) -> Result<(String, Url
 
 async fn measure_segment(source: &SourceConfig, url: &Url) -> Result<(u64, u64), String> {
     let started = Instant::now();
-    let mut response = apply_media_headers(api_client().get(url.clone()), source, url)
+    let mut response = apply_media_headers(client_for(source).get(url.clone()), source, url)
         .header(
             header::RANGE,
             format!("bytes=0-{}", PROBE_SEGMENT_BYTES - 1),
         )
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .map_err(|error| format!("分片请求失败：{}", error.without_url()))?;
@@ -1142,7 +1225,7 @@ fn parse_master_playlist(text: &str, base: &Url) -> Option<MasterVariant> {
             height,
             bandwidth_kbps,
         };
-        let better = best.as_ref().map_or(true, |current| {
+        let better = best.as_ref().is_none_or(|current| {
             (candidate.height, candidate.bandwidth_kbps)
                 > (current.height, current.bandwidth_kbps)
         });
@@ -1457,7 +1540,10 @@ async fn probe_line(source: &SourceConfig, line: &PlayLine) -> PlayProbeLine {
             ..base
         },
         Err(_) => PlayProbeLine {
-            error: Some("探测超时（2s）".to_string()),
+            error: Some(format!(
+                "探测超时（{}s）",
+                PROBE_LINE_TIMEOUT.as_secs()
+            )),
             ..base
         },
     }
@@ -1474,24 +1560,12 @@ async fn search_source(
     source: &SourceConfig,
     query: &str,
 ) -> Result<Vec<PlaySearchItem>, String> {
-    if source.source_type.eq_ignore_ascii_case("anich") {
-        let cache_key = format!("search:{}:{}", source.key, query);
-        if let Some(body) = cache_get(&cache_key) {
-            if let Ok(items) = serde_json::from_str::<Vec<PlaySearchItem>>(&body) {
-                return Ok(items);
-            }
-        }
-        let items = crate::anich::search(query).await?;
-        if let Ok(body) = serde_json::to_string(&items) {
-            cache_put(cache_key, body, SEARCH_TTL);
-        }
-        return Ok(items);
-    }
-    let cache_key = format!("search:{}:{}", source.key, query);
+    // 缓存体是序列化后的完整 items(含多页合并结果),不能用第一页原始响应。
+    let cache_key = format!("search2:{}:{}", source.key, query);
     if let Some(body) = cache_get(&cache_key) {
-        if let Ok(value) = serde_json::from_str::<Value>(&body) {
+        if let Ok(items) = serde_json::from_str::<Vec<PlaySearchItem>>(&body) {
             eprintln!("[play] search {} cache hit", source.key);
-            return parse_search_items(&value, source);
+            return Ok(items);
         }
     }
     breaker_check(&source.key)?;
@@ -1503,7 +1577,7 @@ async fn search_source(
         &source.search_params,
     )?;
     eprintln!("[play] search {} -> {}", source.key, safe_url(&url));
-    let response = apply_source_headers(api_client().get(url), source)
+    let response = apply_source_headers(client_for(source).get(url), source)
         .timeout(SEARCH_TIMEOUT)
         .send()
         .await;
@@ -1556,7 +1630,7 @@ async fn search_source(
             else {
                 break;
             };
-            let Ok(page_response) = apply_source_headers(api_client().get(page_url), source)
+            let Ok(page_response) = apply_source_headers(client_for(source).get(page_url), source)
                 .timeout(SEARCH_TIMEOUT)
                 .send()
                 .await
@@ -1579,7 +1653,11 @@ async fn search_source(
             }
         }
     }
-    cache_put(cache_key, body, SEARCH_TTL);
+    cache_put(
+        cache_key,
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string()),
+        SEARCH_TTL,
+    );
     breaker_success(&source.key);
     eprintln!("[play] search {} ok ({} items)", source.key, items.len());
     Ok(items)
@@ -1589,71 +1667,11 @@ async fn search_source(
 fn cached_detail(source: &SourceConfig, vod_id: &str) -> Option<PlayDetail> {
     let cache_key = format!("detail:{}:{}", source.key, vod_id);
     let body = cache_get(&cache_key)?;
-    if source.source_type.eq_ignore_ascii_case("anich") {
-        return serde_json::from_str::<PlayDetail>(&body).ok();
-    }
     let value: Value = serde_json::from_str(&body).ok()?;
     parse_detail_value(&value, source, vod_id).ok()
 }
 
-/// AniCh 聚合动漫源:详情 + 剧集列表(每集真实名称)→ 单条聚合线路。
-/// 每集 url 形如 anich://{bangumiId}/{sort},resolve 时按需解码并测速选优。
-async fn fetch_anich_detail(
-    source: &SourceConfig,
-    vod_id: &str,
-) -> Result<PlayDetail, String> {
-    if let Some(detail) = cached_detail(source, vod_id) {
-        eprintln!("[play] detail {} cache hit", source.key);
-        return Ok(detail);
-    }
-    breaker_check(&source.key)?;
-    let detail = crate::anich::detail(vod_id).await?;
-    let episodes = detail
-        .episodes
-        .iter()
-        .enumerate()
-        .map(|(index, episode)| PlayEpisode {
-            index,
-            name: if episode.title.is_empty() {
-                format!("第{}集", episode.sort)
-            } else {
-                episode.title.clone()
-            },
-            url: format!("anich://{}/{}", vod_id, episode.sort),
-            format: "hls".to_string(),
-        })
-        .collect::<Vec<_>>();
-    // 缓存弹幕源映射(B站 cid),供 anime_danmaku 使用。
-    if let Ok(body) = serde_json::to_string(&detail.episodes) {
-        cache_put(format!("anich:sites:{vod_id}"), body, DETAIL_TTL);
-    }
-    let detail = PlayDetail {
-        source_key: source.key.clone(),
-        vod_id: vod_id.to_string(),
-        name: detail.name,
-        year: String::new(),
-        type_name: "动漫".to_string(),
-        remarks: String::new(),
-        content: detail.overview,
-        lines: vec![PlayLine {
-            index: 0,
-            name: "AniCh聚合线路".to_string(),
-            format: "hls".to_string(),
-            episodes,
-        }],
-    };
-    if let Ok(body) = serde_json::to_string(&detail) {
-        cache_put(format!("detail:{}:{}", source.key, vod_id), body, DETAIL_TTL);
-    }
-    breaker_success(&source.key);
-    eprintln!("[play] detail {} ok (anich, {} episodes)", source.key, detail.lines[0].episodes.len());
-    Ok(detail)
-}
-
 async fn fetch_detail(source: &SourceConfig, vod_id: &str) -> Result<PlayDetail, String> {
-    if source.source_type.eq_ignore_ascii_case("anich") {
-        return fetch_anich_detail(source, vod_id).await;
-    }
     if let Some(detail) = cached_detail(source, vod_id) {
         eprintln!("[play] detail {} cache hit", source.key);
         return Ok(detail);
@@ -1691,7 +1709,7 @@ async fn fetch_detail(source: &SourceConfig, vod_id: &str) -> Result<PlayDetail,
             action,
             safe_url(&url)
         );
-        let response = apply_source_headers(api_client().get(url), source)
+        let response = apply_source_headers(client_for(source).get(url), source)
             .timeout(DETAIL_TIMEOUT)
             .send()
             .await;
@@ -1792,9 +1810,12 @@ pub async fn play_probe(
     }
     let cache_key = format!("probe:{}:{}", source.key, vod_id);
     if let Some(mut cached) = probe_cache_get(&cache_key) {
-        cached.cached = true;
-        eprintln!("[play] probe {} vod={} cache hit", source.key, vod_id);
-        return Ok(cached);
+        // 全部失败的探测不缓存（兼容旧版本写入的失败结果），让首帧自愈能真正重探。
+        if cached.lines.iter().any(|line| line.ok) {
+            cached.cached = true;
+            eprintln!("[play] probe {} vod={} cache hit", source.key, vod_id);
+            return Ok(cached);
+        }
     }
     let started = Instant::now();
     // P0：probe 只读详情缓存，不触发 detail 网络，避免与 resolve/播放竞争。
@@ -1825,7 +1846,10 @@ pub async fn play_probe(
         cached: false,
         probed_at_ms: epoch_ms(),
     };
-    probe_cache_put(cache_key, result.clone());
+    // 只缓存至少有一条可播线路的结果；全失败交给下次重试。
+    if result.lines.iter().any(|line| line.ok) {
+        probe_cache_put(cache_key, result.clone());
+    }
     for line in &result.lines {
         eprintln!(
             "[play] probe line {} name={:?} ok={} segs={} dur={:.1}s endlist={} ttfb={}ms speed={}kbps stability={:.1} jitter={:.1}ms samples={} fail={} score={:.1} err={:?}",
@@ -1900,10 +1924,7 @@ pub async fn play_search(
         .iter()
         .map(|source| source.key.clone())
         .collect();
-    let mut pending: FuturesUnordered<
-        BoxFuture<'static, (String, Result<Vec<PlaySearchItem>, String>)>,
-    > = FuturesUnordered::new();
-    for source in sources {
+    let mut pending: FuturesUnordered<SearchFuture> = FuturesUnordered::new();    for source in sources {
         let query = query.clone();
         pending.push(Box::pin(async move {
             let result = search_source(&source, &query).await;
@@ -2031,35 +2052,6 @@ pub async fn play_resolve(
         );
     }
     let episode = &line.episodes[safe_episode];
-    if let Some(anich_url) = episode.url.strip_prefix("anich://") {
-        // AniCh 聚合线路:拉取该集全部线路,并发测速选最快(用户要求:直接用最快的,哪怕等)。
-        let parts: Vec<&str> = anich_url.split('/').collect();
-        if parts.len() < 2 {
-            return Err("AniCh 播放地址无效".to_string());
-        }
-        let bangumi_id = parts[0];
-        let episode_sort: u32 = parts[1]
-            .parse()
-            .map_err(|_| "AniCh 集编号无效".to_string())?;
-        let lines = crate::anich::vod_lines(bangumi_id, episode_sort).await?;
-        let expected_duration = crate::anich::cached_episode_duration(bangumi_id, episode_sort);
-        let (line_index, url, format) =
-            crate::anich::pick_fastest(&lines, None, expected_duration).await?;
-        eprintln!(
-            "[play] anich resolve vod={} ep={} -> line {} {} ({})",
-            bangumi_id, episode_sort, line_index, format, lines[line_index].caption
-        );
-        return Ok(PlayTarget {
-            source_key: source.key.clone(),
-            vod_id: detail.vod_id.clone(),
-            line_index: 0,
-            episode_index: safe_episode,
-            url: url.clone(),
-            proxy_url: proxy_url(&source.key, &url),
-            format,
-            use_proxy: true,
-        });
-    }
     let format = episode.format.clone();
     if !matches!(format.as_str(), "hls" | "mp4") {
         return Err(match format.as_str() {
@@ -2095,6 +2087,15 @@ pub async fn play_resolve(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 生成进程内唯一的缓存 key:全局 OnceLock 缓存被所有测试共享,固定 key 会在
+    /// cargo test 并行执行时互相污染。
+    fn unique_test_key(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let sequence = SEQ.fetch_add(1, Ordering::SeqCst);
+        format!("{prefix}:{}:{}", std::process::id(), sequence)
+    }
 
     fn test_source() -> SourceConfig {
         SourceConfig {
@@ -2157,31 +2158,53 @@ mod tests {
 
     #[test]
     fn playable_lines_sort_first_and_reindex() {
+        // page/unknown 线路里 page 被丢弃,unknown 保留但排在最后。
         let lines = parse_play_lines(
             "share$$$m3u8$$$unknown",
             "正片$https://example.com/share/1$$$正片$https://example.com/a.m3u8$$$正片$https://example.com/live/stream",
         );
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].format, "hls");
         assert_eq!(lines[0].index, 0);
-        assert_eq!(lines[1].format, "page");
+        assert_eq!(lines[1].format, "unknown");
         assert_eq!(lines[1].index, 1);
-        assert_eq!(lines[2].format, "unknown");
-        assert_eq!(lines[2].index, 2);
+    }
+
+    #[test]
+    fn drops_page_lines() {
+        let lines = parse_play_lines(
+            "dyttm3u8$$$dytt$$$ffm3u8",
+            "正片$https://example.com/a/1.m3u8$$$正片$https://example.com/share/v$$$正片$https://example.com/b/1.m3u8",
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].name, "dyttm3u8");
+        assert_eq!(lines[1].name, "ffm3u8");
+    }
+
+    #[test]
+    fn drops_yun_play_lines() {
+        let lines = parse_play_lines(
+            "jinyingm3u8$$$jinyingyun$$$ffm3u8",
+            "正片$https://example.com/a/1.m3u8$$$正片$https://example.com/share/v$$$正片$https://example.com/b/1.m3u8",
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].name, "jinyingm3u8");
+        assert_eq!(lines[1].name, "ffm3u8");
     }
 
     #[test]
     fn cached_detail_reads_local_cache_only() {
         let source = test_source();
+        let vod_id = unique_test_key("vod");
         let body = r#"{"vod_id":42,"vod_name":"cache me","vod_play_url":"正片$https://example.com/a.m3u8"}"#;
         cache_put(
-            format!("detail:{}:42", source.key),
+            format!("detail:{}:{}", source.key, vod_id),
             body.to_string(),
             DETAIL_TTL,
         );
-        let detail = cached_detail(&source, "42").unwrap();
+        let detail = cached_detail(&source, &vod_id).unwrap();
         assert_eq!(detail.name, "cache me");
-        assert!(cached_detail(&source, "missing").is_none());
+        assert!(cached_detail(&source, "missing-definitely-absent").is_none());
     }
 
     #[test]
@@ -2272,6 +2295,8 @@ mod tests {
         let url = proxy_url("lzi", "https://cdn.example.com/a/index.m3u8?sign=1");
         assert!(url.starts_with("http://jjstream.localhost/lzi/"));
         assert!(url.contains("https%3A%2F%2Fcdn.example.com%2Fa%2Findex.m3u8"));
+        assert!(url.ends_with(&format!("?k={}", proxy_token())));
+
     }
 
     #[test]
@@ -2296,16 +2321,12 @@ mod tests {
         let detail = parse_detail_value(&value, &test_source(), "14547").unwrap();
         assert_eq!(detail.vod_id, "14547");
         assert_eq!(detail.name, "流浪地球");
-        assert_eq!(detail.lines.len(), 2);
-        // 可播线路排在前，index 同步重排
+        // page 线路(liangzi)在解析层被丢弃,只保留 m3u8 系列
+        assert_eq!(detail.lines.len(), 1);
         assert_eq!(detail.lines[0].name, "lzm3u8");
         assert_eq!(detail.lines[0].index, 0);
         assert_eq!(detail.lines[0].format, "hls");
         assert_eq!(detail.lines[0].episodes[0].format, "hls");
-        assert_eq!(detail.lines[1].name, "liangzi");
-        assert_eq!(detail.lines[1].index, 1);
-        assert_eq!(detail.lines[1].format, "page");
-        assert_eq!(detail.lines[1].episodes[0].format, "page");
     }
 
     #[test]
@@ -2326,10 +2347,9 @@ mod tests {
     fn rejects_detail_without_lines() {
         let value = json!({"vod_id": 1, "vod_name": "empty", "vod_play_url": ""});
         assert!(parse_detail_value(&value, &test_source(), "1").is_err());
+        // 只有网页地址的源在解析层被过滤后等价于无线路,应报错而不是给出 page 线路。
         let page_only = json!({"vod_id": 1, "vod_name": "page", "vod_play_url": "正片$https://example.com/play/1"});
-        let detail = parse_detail_value(&page_only, &test_source(), "1").unwrap();
-        assert_eq!(detail.lines[0].format, "page");
-        assert_eq!(detail.lines[0].episodes[0].format, "page");
+        assert!(parse_detail_value(&page_only, &test_source(), "1").is_err());
     }
 
     #[test]
@@ -2474,19 +2494,20 @@ mod tests {
 
     #[test]
     fn probe_cache_roundtrip() {
+        let vod_id = unique_test_key("probe-cache");
         let result = PlayProbeResult {
             source_key: "lzi".to_string(),
-            vod_id: "probe-cache-1".to_string(),
+            vod_id: vod_id.clone(),
             lines: Vec::new(),
             recommended_line_index: None,
             cached: false,
             probed_at_ms: 1,
         };
-        probe_cache_put("probe:lzi:probe-cache-1".to_string(), result);
-        let hit = probe_cache_get("probe:lzi:probe-cache-1").unwrap();
-        assert_eq!(hit.vod_id, "probe-cache-1");
+        probe_cache_put(format!("probe:lzi:{vod_id}"), result);
+        let hit = probe_cache_get(&format!("probe:lzi:{vod_id}")).unwrap();
+        assert_eq!(hit.vod_id, vod_id);
         assert!(!hit.cached);
-        assert!(probe_cache_get("probe:lzi:missing").is_none());
+        assert!(probe_cache_get("probe:lzi:missing-probe-cache-entry").is_none());
     }
 
     #[test]

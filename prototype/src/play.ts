@@ -141,10 +141,6 @@ export const errorInfoOf = (error: unknown): PlayErrorInfo => {
 const messageOf = (error: unknown) =>
   typeof error === 'string' ? error : error instanceof Error ? error.message : String(error ?? '')
 
-// Windows WebView2 maps http://jjstream.localhost/<key>/<url> to the jjstream protocol.
-export const streamUrl = (sourceKey: string, rawUrl: string) =>
-  `http://jjstream.localhost/${sourceKey}/${encodeURIComponent(rawUrl)}`
-
 const formatOf = (url: string): PlayFormat => {
   const path = url.split('?')[0].toLowerCase()
   if (path.endsWith('.m3u8')) return 'hls'
@@ -191,27 +187,10 @@ export const playResolve = async (
   const target = await invokePlay<PlayTarget>('play_resolve', args)
   return {
     ...target,
-    proxyUrl: target.proxyUrl || streamUrl(sourceKey, target.url),
+    proxyUrl: target.proxyUrl || target.url,
     format: target.format ?? formatOf(target.url),
   }
 }
-
-/* -------------------------------- danmaku -------------------------------- */
-
-export interface DanmakuItem {
-  timeMs: number
-  mode: 'scroll' | 'top' | 'bottom'
-  color: string
-  text: string
-}
-
-// 动漫聚合源的弹幕(AniCh 自建源 + B站代理),CMS 影视源返回空数组。
-export const animeDanmaku = (sourceKey: string, vodId: string, episodeIndex: number) =>
-  invokePlay<DanmakuItem[]>('anime_danmaku', { sourceKey, vodId, episodeIndex }).catch(() => [] as DanmakuItem[])
-
-// 用户网络代理(AniCh 域名通常需要代理直连,与 AniCh 客户端行为一致)。
-export const setNetworkProxy = (proxy: string | null) =>
-  invokePlay<null>('set_network_proxy', { proxy }).catch(() => undefined)
 
 /* ------------------------------ match cache ------------------------------ */
 
@@ -225,14 +204,49 @@ export interface PlayMatch {
 
 const MATCH_KEY = 'jj-play-match'
 const MATCH_TTL = 24 * 60 * 60 * 1000
+const MAX_MATCH_ENTRIES = 512
+
+const isPlayMatch = (value: unknown): value is PlayMatch => {
+  if (!value || typeof value !== 'object') return false
+  const match = value as Partial<PlayMatch>
+  return (
+    typeof match.sourceKey === 'string' &&
+    match.sourceKey.length > 0 &&
+    typeof match.vodId === 'string' &&
+    match.vodId.length > 0 &&
+    typeof match.matchedName === 'string' &&
+    typeof match.updatedAt === 'number' &&
+    Number.isFinite(match.updatedAt)
+  )
+}
 
 const readMatches = (): Record<string, PlayMatch> => {
   try {
     const stored = localStorage.getItem(MATCH_KEY)
-    return stored ? (JSON.parse(stored) as Record<string, PlayMatch>) : {}
+    if (!stored) return {}
+    const parsed: unknown = JSON.parse(stored)
+    if (!parsed || typeof parsed !== 'object') return {}
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>).filter((entry): entry is [string, PlayMatch] =>
+        isPlayMatch(entry[1]),
+      ),
+    )
   } catch {
     return {}
   }
+}
+
+// ps- 条目的 id 自带来源信息：sourceKey 内的 '-' 被转义为 '~'，首个 '-' 是分隔符。
+export const sourceFromTitleId = (
+  titleId: string,
+): { sourceKey: string; vodId: string } | null => {
+  if (!titleId.startsWith('ps-')) return null
+  const rest = titleId.slice(3)
+  const separator = rest.indexOf('-')
+  if (separator <= 0) return null
+  const sourceKey = rest.slice(0, separator).replace(/~/g, '-')
+  const vodId = rest.slice(separator + 1)
+  return sourceKey && vodId ? { sourceKey, vodId } : null
 }
 
 export const readMatch = (titleId: string): PlayMatch | null => {
@@ -246,7 +260,14 @@ export const writeMatch = (titleId: string, match: Omit<PlayMatch, 'updatedAt'>)
   try {
     const matches = readMatches()
     matches[titleId] = { ...match, updatedAt: Date.now() }
-    localStorage.setItem(MATCH_KEY, JSON.stringify(matches))
+    const now = Date.now()
+    const entries = Object.entries(matches)
+      .filter(([, entry]) => now - entry.updatedAt <= MATCH_TTL)
+      .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
+    if (entries.length > MAX_MATCH_ENTRIES) {
+      entries.splice(0, entries.length - MAX_MATCH_ENTRIES)
+    }
+    localStorage.setItem(MATCH_KEY, JSON.stringify(Object.fromEntries(entries)))
   } catch {
     // match cache is an optimization only
   }
@@ -264,28 +285,76 @@ export const clearMatch = (titleId: string) => {
 
 /* ------------------------------- matching -------------------------------- */
 
-const normalizeName = (raw: string) =>
+const EDITION_MARKERS =
+  /(?:国语|粤语|英语|双语|中字|中英字幕|中文字幕|字幕|高清|超清|蓝光|blu-?ray|web-?dl|hdr|4k|2160p|1080p|720p|加长版|完整版|未删减|导演剪辑版|特别版|修复版|重制版|重映版|remastered|extended|uncut|director'?s?\s*cut)/gi
+
+// 解说/预告/花絮等二创与片段不是正片，自动匹配必须拒绝。
+const VARIANT_MARKERS =
+  /(?:解说|预告|花絮|片段|特辑|彩蛋|混剪|盘点|速看|影评|合集|reaction|trailer|teaser|behind[\s-]*the[\s-]*scenes)/i
+const SEASON_EPISODE_MARKERS =
+  /(?:第[一二三四五六七八九十百0-9]+[季部集期]|season\s*\d+|s\d{1,2}(?:e\d{1,3})?|episode\s*\d+)/i
+const SPINOFF_MARKERS = /(?:外传|前传|后传|番外|剧场版|特别篇|衍生|之|篇)/
+const SERIES_TYPE_MARKERS =
+  /(?:电视剧|连续剧|短剧|网剧|美剧|韩剧|日剧|泰剧|港剧|台剧|国产剧|欧美剧|日韩剧|海外剧|剧集|动漫|动画|番剧|综艺|纪录片|记录片)/
+
+export const sourceTypeIsSeries = (typeName?: string) =>
+  Boolean(typeName && SERIES_TYPE_MARKERS.test(typeName))
+
+const stripDecorations = (raw: string) =>
   raw
+    .replace(/[（(\[]\s*(?:19|20)\d{2}\s*[)）\]]/g, ' ')
+    .replace(EDITION_MARKERS, ' ')
+
+const normalizeName = (raw: string) =>
+  stripDecorations(raw)
     .normalize('NFKC')
     .toLowerCase()
     .replace(/[\s·•・:：!！?？'"“”‘’.,，。、~～\-—_()（）[\]【】]/g, '')
 
-const seriesTypePattern = /剧|动漫|动画|综艺|纪录/
+const containmentExtra = (name: string, candidate: string) => {
+  if (name === candidate) return ''
+  if (name.includes(candidate)) return name.replace(candidate, '')
+  if (candidate.includes(name)) return candidate.replace(name, '')
+  return null
+}
+
+const isSafeContainment = (
+  titleName: string,
+  candidateName: string,
+  normalizedTitle: string,
+  normalizedCandidate: string,
+) => {
+  const extra = containmentExtra(normalizedTitle, normalizedCandidate)
+  if (extra === null) return false
+  if (!extra) return true
+  if (Math.min(normalizedTitle.length, normalizedCandidate.length) < 2) return false
+  // 解说/预告与季集标记必须双方同时存在，避免把二创、续集或不同季当成正片。
+  if (
+    VARIANT_MARKERS.test(titleName) !== VARIANT_MARKERS.test(candidateName) ||
+    SEASON_EPISODE_MARKERS.test(titleName) !== SEASON_EPISODE_MARKERS.test(candidateName)
+  ) {
+    return false
+  }
+  // 包含匹配只接受很小的中文版本后缀；数字、英文副标题、外传/番外一律拒绝。
+  if (/\d/.test(extra) || /[a-z]/i.test(extra)) return false
+  if (SPINOFF_MARKERS.test(extra)) return false
+  return extra.length <= 3
+}
 
 /// 播放源标题是否与片库标题对得上(用于校验 match 缓存,防止把《黑球》当成《尼古喵喵》)。
+/// 包含匹配要求较短一方至少 2 个字符，且拒绝解说、预告、续集、外传等变体。
 export function matchTitleName(title: Title, candidateName: string | undefined): boolean {
   if (!candidateName) return false
   const target = normalizeName(candidateName)
   if (!target) return false
   return [title.name, title.originalName]
     .filter((name): name is string => Boolean(name))
-    .map(normalizeName)
-    .some((name) => name === target || name.includes(target) || target.includes(name))
-}
-
-/// 动漫条目:优先 AniCh(专门做动漫,MP4 源干净且带弹幕)。
-export function isAnimeTitle(title: Title): boolean {
-  return title.genres.some((genre) => /动画|动漫/.test(genre)) || title.name.includes('动画')
+    .some((name) => {
+      const normalized = normalizeName(name)
+      if (!normalized) return false
+      if (normalized === target) return true
+      return isSafeContainment(name, candidateName, normalized, target)
+    })
 }
 
 export function rankCandidates(title: Title, items: PlaySearchItem[]): PlaySearchItem[] {
@@ -295,12 +364,12 @@ export function rankCandidates(title: Title, items: PlaySearchItem[]): PlaySearc
   const year = title.year
   const scored = items.map((item) => {
     const itemName = normalizeName(item.name)
-    let nameScore = 0
-    for (const name of names) {
-      if (!name || !itemName) continue
-      if (itemName === name) nameScore = Math.max(nameScore, 100)
-      else if (itemName.includes(name) || name.includes(itemName)) nameScore = Math.max(nameScore, 60)
+    const exact = Boolean(itemName) && names.includes(itemName)
+    // 搜索接口是模糊匹配，名称对不上的结果（同名电影、动画、解说等）宁可判为无源。
+    if (!exact && !matchTitleName(title, item.name)) {
+      return { item, score: Number.NEGATIVE_INFINITY, nameScore: 0 }
     }
+    const nameScore = exact ? 100 : 60
     let score = nameScore
     const itemYear = Number.parseInt(item.year, 10)
     if (year > 0 && Number.isFinite(itemYear)) {
@@ -310,14 +379,11 @@ export function rankCandidates(title: Title, items: PlaySearchItem[]): PlaySearc
       else if (gap > 2) score -= 15
     }
     const wantsSeries = title.mediaType === 'series'
-    if (wantsSeries === seriesTypePattern.test(item.typeName)) score += 10
+    if (wantsSeries === sourceTypeIsSeries(item.typeName)) score += 10
     return { item, score, nameScore }
   })
-  // 搜索接口是模糊匹配,名称对不上的结果(例如把动画匹配成同名年份的电影)
-  // 宁可判为无源,也不能播出错误内容。
-  const hasNameMatch = scored.some((entry) => entry.nameScore > 0)
   return scored
-    .filter((entry) => hasNameMatch && entry.nameScore > 0)
+    .filter((entry) => Number.isFinite(entry.score) && entry.nameScore > 0)
     .sort((left, right) => right.score - left.score)
     .map((entry) => entry.item)
 }
@@ -375,14 +441,132 @@ export const episodeNumberOf = (title: Title, episodeId?: string): number | unde
 export const episodeIdForIndex = (title: Title, index: number): string | undefined =>
   title.episodes?.find((episode) => episode.number === index + 1)?.id
 
+/* ---------------------------- aggregate lines ----------------------------- */
+
+/** 线路面板的聚合条目:跨全部候选源的线路平铺,附带集数供用户分辨"全集源/单集源"。 */
+export interface AggregateLine {
+  sourceKey: string
+  vodId: string
+  sourceName: string
+  lineIndex: number
+  lineName: string
+  format: string
+  episodeCount: number
+  playable: boolean
+  /** 源在候选排名里的位次(用于稳定排序,展示不需要) */
+  rank: number
+  detail: PlayDetail
+}
+
+export function mergeSourceLines(
+  sourceDetails: { detail: PlayDetail; sourceName: string; rank: number }[],
+): AggregateLine[] {
+  const merged: AggregateLine[] = []
+  for (const { detail, sourceName, rank } of sourceDetails) {
+    detail.lines.forEach((line, lineIndex) => {
+      merged.push({
+        sourceKey: detail.sourceKey,
+        vodId: detail.vodId,
+        sourceName,
+        lineIndex,
+        lineName: line.name,
+        format: line.format ?? 'unknown',
+        episodeCount: line.episodes.length,
+        playable: isPlayableLine(line),
+        rank,
+        detail,
+      })
+    })
+  }
+  // 可播优先;同为可播时集数多的线路在前(如哆啦A梦:全集源应排在只匹配到第 1 集的源之前)。
+  return merged.sort(
+    (left, right) =>
+      Number(right.playable) - Number(left.playable) ||
+      right.episodeCount - left.episodeCount ||
+      left.rank - right.rank ||
+      left.lineIndex - right.lineIndex,
+  )
+}
+
+export async function aggregateSourceLines(
+  title: Title,
+  options: {
+    excludeSourceKeys?: string[]
+    maxSources?: number
+    sourceNames?: Record<string, string>
+  } = {},
+): Promise<{ lines: AggregateLine[]; sourceErrors: string[] }> {
+  const excluded = new Set(options.excludeSourceKeys ?? [])
+  const queries = Array.from(
+    new Set(
+      [title.name?.trim(), title.originalName?.trim()].filter(
+        (query): query is string => Boolean(query),
+      ),
+    ),
+  )
+  if (queries.length === 0) return { lines: [], sourceErrors: [] }
+  const sourceErrors: string[] = []
+  const seenCandidates = new Set<string>()
+  let candidates: PlaySearchItem[] = []
+  let ranked: PlaySearchItem[] = []
+  for (const query of queries) {
+    try {
+      const response = await playSearch(query)
+      for (const sourceError of response.errors ?? []) {
+        sourceErrors.push(`${sourceError.sourceKey}: ${sourceError.message}`)
+      }
+      for (const item of response.items ?? []) {
+        if (excluded.has(item.sourceKey)) continue
+        const key = `${item.sourceKey}|${item.vodId}`
+        if (seenCandidates.has(key)) continue
+        seenCandidates.add(key)
+        candidates.push(item)
+      }
+      ranked = rankCandidates(title, candidates)
+      if (ranked.length > 0) break
+    } catch (error) {
+      sourceErrors.push(`${query}: ${messageOf(error)}`)
+    }
+  }
+  if (ranked.length === 0) return { lines: [], sourceErrors }
+  // 先按源取最佳候选，再截断；否则前 N 条可能全被同一个源占满。
+  const bySource = new Map<string, PlaySearchItem>()
+  for (const item of ranked) {
+    if (!bySource.has(item.sourceKey)) bySource.set(item.sourceKey, item)
+  }
+  const picks = [...bySource.entries()].slice(0, options.maxSources ?? 6)
+  const settled = await Promise.allSettled(
+    picks.map(async ([sourceKey, item], index) => {
+      const detail = await playDetail(sourceKey, item.vodId)
+      return {
+        detail,
+        sourceName: options.sourceNames?.[sourceKey] ?? sourceKey,
+        rank: index,
+      }
+    }),
+  )
+  const sourceDetails: { detail: PlayDetail; sourceName: string; rank: number }[] = []
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      sourceDetails.push(result.value)
+    } else {
+      sourceErrors.push(`${picks[index][0]}: ${messageOf(result.reason)}`)
+    }
+  })
+  return { lines: mergeSourceLines(sourceDetails), sourceErrors }
+}
+
 /* ------------------------------- resolving -------------------------------- */
 
 export interface ResolveSessionOptions {
   episodeIndex?: number
   preferredLine?: number
+  preferredSourceKey?: string
   excludeSourceKey?: string
   excludeSourceKeys?: string[]
   maxCandidates?: number
+  /// 已拿到的详情（换线/换集/重试）优先直接使用，避免重复搜索。
+  detail?: PlayDetail
   onSourceFailure?: (sourceKey: string, error: unknown) => void
 }
 
@@ -430,19 +614,60 @@ export async function resolveSession(
 ): Promise<ResolvedSession> {
   const excluded = new Set(options.excludeSourceKeys ?? [])
   if (options.excludeSourceKey) excluded.add(options.excludeSourceKey)
-  const cache = readMatch(title.id)
-  const anime = isAnimeTitle(title)
-  const cacheAllowed = !anime || cache?.sourceKey === 'anich'
-  if (cache && (!matchTitleName(title, cache.matchedName) || !cacheAllowed)) {
-    console.info('[jj] stale play match dropped', title.name, cache.sourceKey, cache.matchedName)
+  const encodedSource = sourceFromTitleId(title.id)
+  const storedMatch = readMatch(title.id)
+  if (storedMatch && !matchTitleName(title, storedMatch.matchedName)) {
+    console.info(
+      '[jj] stale play match dropped',
+      title.name,
+      storedMatch.sourceKey,
+      storedMatch.matchedName,
+    )
     clearMatch(title.id)
   }
+  // ps- 条目的 id 自带来源信息，不依赖搜索阶段写入 match 缓存。
+  const validStoredMatch =
+    storedMatch && matchTitleName(title, storedMatch.matchedName) ? storedMatch : null
+  const cache: PlayMatch | null =
+    validStoredMatch ??
+    (encodedSource
+      ? {
+          ...encodedSource,
+          lineIndex: 0,
+          matchedName: title.name,
+          updatedAt: Date.now(),
+        }
+      : null)
+  const sourceErrors: PlaySourceError[] = []
+  const failures: string[] = []
+
   if (
+    options.detail &&
+    !excluded.has(options.detail.sourceKey) &&
+    (!options.preferredSourceKey || options.detail.sourceKey === options.preferredSourceKey) &&
+    options.detail.lines?.some((line) => isPlayableLine(line))
+  ) {
+    try {
+      const resolved = await resolveFromDetail(options.detail, options)
+      writeMatch(title.id, {
+        sourceKey: options.detail.sourceKey,
+        vodId: options.detail.vodId,
+        lineIndex: resolved.lineIndex,
+        matchedName: options.detail.name,
+      })
+      return { detail: options.detail, ...resolved, sourceErrors: [] }
+    } catch (error) {
+      failures.push(`${options.detail.sourceKey}: ${messageOf(error)}`)
+      options.onSourceFailure?.(options.detail.sourceKey, error)
+    }
+  }
+
+  const cacheUsable =
     cache &&
     matchTitleName(title, cache.matchedName) &&
-    cacheAllowed &&
-    !excluded.has(cache.sourceKey)
-  ) {
+    // 用户显式指定源(线路面板跨源切换)时,不得被旧 match 缓存抢走。
+    (!options.preferredSourceKey || cache.sourceKey === options.preferredSourceKey)
+  if (cacheUsable && cache && !excluded.has(cache.sourceKey)) {
     try {
       const detail = await playDetail(cache.sourceKey, cache.vodId)
       if (detail.lines?.some((line) => isPlayableLine(line))) {
@@ -462,72 +687,61 @@ export async function resolveSession(
   }
 
   const queries = Array.from(
-    new Set([title.name?.trim(), title.originalName?.trim()].filter((query): query is string => Boolean(query))),
+    new Set(
+      [title.name?.trim(), title.originalName?.trim()].filter(
+        (query): query is string => Boolean(query),
+      ),
+    ),
   )
-  const failures: string[] = []
+  const seenCandidates = new Set<string>()
   let candidates: PlaySearchItem[] = []
-  let sourceErrors: PlaySourceError[] = []
+  let ranked: PlaySearchItem[] = []
 
   for (const query of queries) {
     try {
       const response = await playSearch(query)
-      sourceErrors = response.errors ?? []
-      candidates = (response.items ?? []).filter((item) => !excluded.has(item.sourceKey))
-      if (candidates.length > 0) break
+      for (const sourceError of response.errors ?? []) sourceErrors.push(sourceError)
+      for (const item of response.items ?? []) {
+        if (excluded.has(item.sourceKey)) continue
+        const key = `${item.sourceKey}|${item.vodId}`
+        if (seenCandidates.has(key)) continue
+        seenCandidates.add(key)
+        candidates.push(item)
+      }
+      // 第一种名称的结果可能全是同名烂片/解说；ranking 为空时继续尝试原名。
+      const attempt = rankCandidates(title, candidates)
+      if (attempt.length > 0) {
+        ranked = attempt
+        break
+      }
     } catch (error) {
       failures.push(`${query}: ${messageOf(error)}`)
     }
   }
 
-  // 聚合搜索有总预算,AniCh 响应慢时经常在返回前就结束。
-  // 动漫额外显式查一次 AniCh,保证它一定在候选里(失败再回退 CMS)。
-  if (anime) {
-    for (const query of queries) {
-      try {
-        const response = await playSearch(query, 'anich')
-        const items = (response.items ?? []).filter((item) => !excluded.has(item.sourceKey))
-        if (items.length > 0) {
-          const seen = new Set(candidates.map((item) => `${item.sourceKey}:${item.vodId}`))
-          candidates = [
-            ...items.filter((item) => !seen.has(`${item.sourceKey}:${item.vodId}`)),
-            ...candidates,
-          ]
-          break
-        }
-      } catch (error) {
-        console.info('[jj] anich search failed', messageOf(error))
-      }
-    }
-  }
-
-  if (candidates.length === 0) {
+  if (ranked.length === 0) {
     const detail = [
       ...failures,
       ...sourceErrors.map((sourceError) => `${sourceError.sourceKey}: ${sourceError.message}`),
+      candidates.length > 0 ? '搜索结果的标题与片名不符，已拒绝自动匹配' : '',
     ]
       .filter(Boolean)
       .join(' | ')
     throw new PlayRequestError('no-source', '未找到可用的播放源', detail || undefined)
   }
 
-  const rankedAll = rankCandidates(title, candidates)
-  // 动漫条目优先 AniCh 聚合源(多线路测速选优 + 弹幕)
-  const ranked = (anime
-    ? [
-        ...rankedAll.filter((item) => item.sourceKey === 'anich'),
-        ...rankedAll.filter((item) => item.sourceKey !== 'anich'),
-      ]
-    : rankedAll
-  ).slice(0, options.maxCandidates ?? 3)
-  if (ranked.length === 0) {
-    throw new PlayRequestError(
-      'no-source',
-      '未找到匹配的播放源',
-      '搜索结果的标题与片名不符，已拒绝自动匹配',
-    )
-  }
+  // 用户从线路面板显式点选的源优先尝试,且不受默认候选数限制挤掉。
+  const preferred =
+    options.preferredSourceKey
+      ? ranked.find((item) => item.sourceKey === options.preferredSourceKey)
+      : undefined
+  const ordered = preferred ? [preferred, ...ranked.filter((item) => item !== preferred)] : ranked
+  const rankedCandidates = ordered.slice(
+    0,
+    Math.max(options.maxCandidates ?? 3, preferred ? 1 : 0),
+  )
   let sawUnsupported = false
-  for (const candidate of ranked) {
+  for (const candidate of rankedCandidates) {
     try {
       const detail = await playDetail(candidate.sourceKey, candidate.vodId)
       if (!detail.lines?.some((line) => isPlayableLine(line))) {

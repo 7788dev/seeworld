@@ -1,8 +1,8 @@
+import { useRef } from 'react'
 import {
   Bookmark,
   Clapperboard,
   Clock3,
-  Download,
   Flame,
   Home,
   Plus,
@@ -15,6 +15,7 @@ import {
 import type { ViewKey } from '../data'
 import { useI18n } from '../i18n'
 import { cx } from '../lib'
+import { useFocusTrap } from '../useFocusTrap'
 
 interface SidebarProps {
   active: ViewKey
@@ -37,7 +38,6 @@ const browseItems = [
 const libraryItems = [
   { key: 'recent' as const, labelKey: 'nav.recent' as const, icon: Clock3 },
   { key: 'later' as const, labelKey: 'nav.later' as const, icon: Bookmark },
-  { key: 'downloads' as const, labelKey: 'nav.downloads' as const, icon: Download },
   { key: 'settings' as const, labelKey: 'nav.settings' as const, icon: Settings },
 ]
 
@@ -50,6 +50,8 @@ export default function Sidebar({
   onClose,
 }: SidebarProps) {
   const { t } = useI18n()
+  const sidebarRef = useRef<HTMLElement>(null)
+  useFocusTrap(sidebarRef, open)
 
   const select = (key: ViewKey) => {
     onNavigate(key)
@@ -64,7 +66,7 @@ export default function Sidebar({
         tabIndex={open ? 0 : -1}
         onClick={onClose}
       />
-      <aside className={cx('sidebar', open && 'is-open')}>
+      <aside className={cx('sidebar', open && 'is-open')} ref={sidebarRef}>
         <button className="sidebar-close" aria-label={t('nav.close')} onClick={onClose}>
           <X size={18} />
         </button>

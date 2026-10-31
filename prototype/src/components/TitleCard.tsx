@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { Check, Play, Plus } from 'lucide-react'
 import { mediaLabel, titleGenres, titleName } from '../content'
 import type { Title } from '../data'
@@ -16,7 +17,8 @@ interface TitleCardProps {
   onToggleList: (id: string) => void
 }
 
-export default function TitleCard({
+// memo:播放中 App 每秒只有 Theater 局部更新,卡片不应跟着全量重渲染。
+function TitleCard({
   title,
   variant = 'poster',
   inList,
@@ -29,6 +31,7 @@ export default function TitleCard({
   const { language, t } = useI18n()
   const name = titleName(title, language)
   const progressPct = progress ? percentage(progress.current, progress.duration) : 0
+  const fromSource = title.id.startsWith('ps-')
   const titleClass = cx(
     'card-title',
     `type-${title.titleStyle}`,
@@ -77,6 +80,7 @@ export default function TitleCard({
         <div className="card-brand">
           <span className="n-mark">S</span>
           <span>{mediaLabel(title.mediaType, language)}</span>
+          {fromSource && <span className="card-source">{t('card.source')}</span>}
         </div>
         <h3 className={titleClass}>
           {title.titleLines.map((line) => (
@@ -112,3 +116,5 @@ export default function TitleCard({
     </article>
   )
 }
+
+export default memo(TitleCard)

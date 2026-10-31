@@ -17,18 +17,17 @@
 
 ## 播放链路
 
-- 7 个影视 CMS 源 + AniCh 动漫聚合，注册在 `src-tauri/resources/play-sources.json`，可用 `%APPDATA%/com.jianjie.desktop/play-sources.json` 覆盖。
-- 搜索全源并发聚合；详情与线路并发探测，按速度/稳定性/质量评分，MP4 直链与 H.264 优先。
-- HLS/MP4 经 `jjstream` 代理；按线路过滤广告（时长指纹、关键词、短分片），MP4 大文件按 16MB Range 分段回源。
-- 动漫优先 AniCh；弹幕按集聚合 AniCh 与 B 站弹幕，Canvas 渲染。
-- 自动换源仅三种触发：启动无帧、单次冻结 60 秒、5 分钟内 ≥3 次真实卡顿。
+- 7 个影视 CMS 源（dyttzy/ffzy 核心，lzi/bfzy/jyzy/piaoling2 备用池；jszy 因封皮错配保持禁用），注册在 `src-tauri/resources/play-sources.json`，可用 `%APPDATA%/com.jianjie.desktop/play-sources.json` 覆盖。AniCh 动漫聚合源与弹幕功能已移除。
+- 搜索全源并发聚合（按 `pagecount` 最多 4 页）；详情与线路并发探测，按速度/稳定性/质量评分（0.7/0.2/0.1），probe 只读详情缓存不发网络。
+- HLS/MP4 经 `jjstream` 代理（带启动随机 token，无 token 403）；按线路过滤广告（时长指纹、关键词、短分片 + 安全阈值），MP4 大文件按 16MB Range 分段回源；SSRF 防护含连接层 DNS 逐 IP 校验。
+- 自动换源仅三种触发：启动无帧、单次冻结 60 秒、5 分钟内 ≥3 次真实卡顿；实时位置走 `liveTimeRef`，不逐秒触发 React 渲染。
 
 ## 备选与取舍
 
 - frodo 移动端 API 需要已失效的公开 key；详情页 HTML 解析被风控；前端直连豆瓣受 CORS/Referer 拦截；图片无 Referer 返回 418。以上方案均弃用。
+- AniCh 聚合与弹幕（protobuf 解码、Canvas 渲染）因维护成本高被整体移除（2026-10-31）。
 
 ## 遗留
 
 - top250 无官方 JSON API。
 - 片库注册表超过 localStorage 配额时的裁剪策略仍可细化。
-- AniCh 上游协议变动需同步手写 protobuf 解码与 UA。

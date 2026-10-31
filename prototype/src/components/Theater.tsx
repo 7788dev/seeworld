@@ -5,7 +5,6 @@ import {
   ArrowLeft,
   ListVideo,
   Maximize2,
-  MessageSquareText,
   Minimize2,
   Pause,
   Play,
@@ -28,13 +27,12 @@ import { formatTime } from '../data'
 import type { Episode, Title } from '../data'
 import { useI18n } from '../i18n'
 import { cx, isDesktopApp, percentage, usePersistentState } from '../lib'
-import { animeDanmaku, isPlayableEpisode, isPlayableLine, nextPlayableLineIndex, playableLines } from '../play'
-import type { PlayErrorInfo, PlayProbeResult } from '../play'
+import { isPlayableEpisode, isPlayableLine, nextPlayableLineIndex, playableLines } from '../play'
+import type { AggregateLine, PlayErrorInfo, PlayProbeLine, PlayProbeResult } from '../play'
 import type { PlaybackState, PlaybackStatus } from '../types'
 import { useHlsPlayer } from '../player/useHlsPlayer'
 import type { MediaPhase } from '../player/useHlsPlayer'
-import DanmakuLayer from './DanmakuLayer'
-import type { DanmakuItem } from '../play'
+import { useFocusTrap } from '../useFocusTrap'
 import type { PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window'
 
 interface TheaterProps {
@@ -42,21 +40,21 @@ interface TheaterProps {
   playback: PlaybackState
   probe?: PlayProbeResult
   sourceName?: string
+  allLines: AggregateLine[]
   expectedDuration?: number
   onClose: () => void
-  onProgress: (current: number, duration: number) => void
+  onProgress: (current: number, duration: number, episodeId?: string, episodeIndex?: number) => void
   onLiveTime: (current: number, duration: number) => void
   onFirstFrame: () => void
   onStatus: (status: PlaybackStatus) => void
   onMediaError: (error: PlayErrorInfo) => void
-  danmakuOn: boolean
-  onToggleDanmaku: () => void
   onShortBuffer: (stallMs: number) => void
   onRebufferSwitch: (count: number) => void
   onSingleStall: () => void
   onStartupActivity: () => void
   onRetry: () => void
   onSwitchLine: (lineIndex: number) => void
+  onSwitchToLine: (sourceKey: string, lineIndex: number) => void
   onSwitchSource: () => void
   onPlayEpisode: (episode: Episode) => void
   onSelectSourceEpisode: (index: number) => void
@@ -66,7 +64,8 @@ interface TheaterProps {
 const formatSpeed = (kbps: number) =>
   kbps >= 1024 ? `${(kbps / 1024).toFixed(1)} MB/s` : `${Math.max(1, Math.round(kbps))} KB/s`
 
-const toPlaybackStatus = (phase: MediaPhase): PlaybackStatus | null => {  switch (phase) {
+const toPlaybackStatus = (phase: MediaPhase): PlaybackStatus | null => {
+  switch (phase) {
     case 'idle':
       return null
     case 'loading':
@@ -91,6 +90,7 @@ export default function Theater({
   playback,
   probe,
   sourceName,
+  allLines,
   expectedDuration,
   onClose,
   onProgress,
@@ -98,14 +98,13 @@ export default function Theater({
   onFirstFrame,
   onStatus,
   onMediaError,
-  danmakuOn,
-  onToggleDanmaku,
   onShortBuffer,
   onRebufferSwitch,
   onSingleStall,
   onStartupActivity,
   onRetry,
   onSwitchLine,
+  onSwitchToLine,
   onSwitchSource,
   onPlayEpisode,
   onSelectSourceEpisode,
@@ -122,12 +121,21 @@ export default function Theater({
   const [volume, setVolume] = usePersistentState(
     'jj-player-volume',
     playback.volume > 0 ? playback.volume : 0.72,
+    (value) =>
+      typeof value === 'number' && Number.isFinite(value)
+        ? Math.min(1, Math.max(0, value))
+        : 0.72,
   )
-  const [muted, setMuted] = usePersistentState('jj-player-muted', playback.muted)
+  const [muted, setMuted] = usePersistentState(
+    'jj-player-muted',
+    playback.muted,
+    (value) => (typeof value === 'boolean' ? value : false),
+  )
   const hideTimer = useRef<number | null>(null)
   const stageClickTimer = useRef<number | null>(null)
   const lastPointer = useRef<{ x: number; y: number } | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(rootRef)
   const topRef = useRef<HTMLElement>(null)
   const dockRef = useRef<HTMLDivElement>(null)
   const onProgressRef = useRef(onProgress)
@@ -157,13 +165,13 @@ export default function Theater({
     size?: PhysicalSize
   } | null>(null)
 
-  const flushProgress = useCallback((force: boolean) => {
-    const snapshot = progressRef.current
-    if (!(snapshot.duration > 0)) return
-    if (!force && !snapshot.dirty) return
-    onProgressRef.current(snapshot.current, snapshot.duration)
-    snapshot.lastSent = Date.now()
-    snapshot.dirty = false
+  const flushProgress = useCallback((force: boolean, snapshot?: { episodeId?: string; episodeIndex?: number }) => {
+    const s = progressRef.current
+    if (!(s.duration > 0)) return
+    if (!force && !s.dirty) return
+    onProgressRef.current(s.current, s.duration, snapshot?.episodeId, snapshot?.episodeIndex)
+    s.lastSent = Date.now()
+    s.dirty = false
   }, [])
 
   const handleTime = useCallback((current: number, duration: number) => {
@@ -221,32 +229,15 @@ export default function Theater({
     ? `${playback.target.sourceKey}|${playback.target.lineIndex}|${playback.target.episodeIndex}`
     : 'none'
 
-  // 弹幕:动漫聚合源按集拉取;其它源为空数组(层自动隐藏)。
-  const [danmakuItems, setDanmakuItems] = useState<DanmakuItem[]>([])
-  const danmakuEpisodeIndex = playback.target?.episodeIndex ?? 0
   useEffect(() => {
-    const target = playback.target
-    if (!target) {
-      setDanmakuItems([])
-      return
-    }
-    let cancelled = false
-    setDanmakuItems([])
-    void animeDanmaku(target.sourceKey, target.vodId, target.episodeIndex ?? 0).then(
-      (items) => {
-        if (!cancelled) setDanmakuItems(items)
-      },
-    )
-    return () => {
-      cancelled = true
-    }
-  }, [targetKey, danmakuEpisodeIndex])
-
-  useEffect(() => {
+    // cleanup 闭包捕获的是本 effect 所属渲染的集数信息（targetKey 变化前的旧集），
+    // 换集时补发的最终快照因此归属旧集，不会写错到新集头上。
+    const snapshot = { episodeId: playback.episodeId, episodeIndex: playback.episodeIndex }
     progressRef.current = { current: 0, duration: 0, lastSent: 0, dirty: false }
     firstFrameSeenRef.current = false
     reportedBufferRef.current = 0
-    return () => flushProgress(true)
+    return () => flushProgress(true, snapshot)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetKey, flushProgress])
 
   // 首帧前缓冲仍在增长 = 源"慢而活"(分片在正常下载),上报活动让启动窗口延长,
@@ -266,6 +257,97 @@ export default function Theater({
   const doubanEpisodes = title.episodes ?? []
   const hasSourceEpisodes = sourceEpisodes.length > 0
   const hasEpisodeList = hasSourceEpisodes || doubanEpisodes.length > 0
+
+
+  // 线路面板:优先展示跨源聚合结果(每条带源名与集数);聚合未就绪时回退当前源线路。
+  interface LineTabView {
+    sourceKey: string
+    sourceName: string
+    lineIndex: number
+    lineName: string
+    playable: boolean
+    episodeCount: number
+    active: boolean
+    probeLine?: PlayProbeLine
+  }
+  const lineTabs: LineTabView[] =
+    allLines.length > 0
+      ? allLines.map((item) => ({
+          sourceKey: item.sourceKey,
+          sourceName: item.sourceName,
+          lineIndex: item.lineIndex,
+          lineName: item.lineName,
+          playable: item.playable,
+          episodeCount: item.episodeCount,
+          active: item.sourceKey === playback.sourceKey && item.lineIndex === playback.lineIndex,
+          probeLine:
+            item.sourceKey === playback.sourceKey
+              ? probe?.lines.find((entry) => entry.lineIndex === item.lineIndex)
+              : undefined,
+        }))
+      : lines.map((line, index) => ({
+          sourceKey: playback.sourceKey ?? '',
+          sourceName: sourceName ?? '',
+          lineIndex: index,
+          lineName: line.name,
+          playable: isPlayableLine(line),
+          episodeCount: line.episodes.length,
+          active: index === activeLineIndex,
+          probeLine: probe?.lines.find((entry) => entry.lineIndex === index),
+        }))
+
+  // 线路条横向滑动:鼠标滚轮把垂直滚动转为横向;按住左键拖拽自由滑动,
+  // 拖拽后的 click 会被吞掉,避免拖拽误触发线路切换。
+  // 线路条随抽屉按需挂载,监听必须在节点出现后重新绑定。
+  const lineTabsRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const node = lineTabsRef.current
+    if (!node) return
+    const draggable = () => node.scrollWidth > node.clientWidth + 4
+    const dragState = { dragging: false, moved: false, startX: 0, startScroll: 0 }
+    const onWheel = (event: WheelEvent) => {
+      if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return
+      if (!draggable()) return
+      node.scrollLeft += event.deltaY
+      event.preventDefault()
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.button !== 0 || !draggable()) return
+      dragState.dragging = true
+      dragState.moved = false
+      dragState.startX = event.clientX
+      dragState.startScroll = node.scrollLeft
+    }
+    const onPointerMove = (event: PointerEvent) => {
+      if (!dragState.dragging) return
+      const delta = event.clientX - dragState.startX
+      if (Math.abs(delta) > 5) dragState.moved = true
+      node.scrollLeft = dragState.startScroll - delta
+    }
+    const onPointerUp = () => {
+      dragState.dragging = false
+    }
+    const onClickCapture = (event: MouseEvent) => {
+      if (!dragState.moved) return
+      dragState.moved = false
+      event.preventDefault()
+      event.stopPropagation()
+    }
+    node.addEventListener('wheel', onWheel, { passive: false })
+    node.addEventListener('pointerdown', onPointerDown)
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', onPointerUp)
+    window.addEventListener('pointercancel', onPointerUp)
+    node.addEventListener('click', onClickCapture, true)
+    return () => {
+      node.removeEventListener('wheel', onWheel)
+      node.removeEventListener('pointerdown', onPointerDown)
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', onPointerUp)
+      window.removeEventListener('pointercancel', onPointerUp)
+      node.removeEventListener('click', onClickCapture, true)
+    }
+  }, [episodesOpen, hasEpisodeList, lineTabs.length])
   const currentSourceEpisode =
     sourceEpisodes[
       Math.min(playback.episodeIndex ?? 0, Math.max(0, sourceEpisodes.length - 1))
@@ -532,49 +614,52 @@ export default function Theater({
     }
   }, [immersive, isPlaying, episodesOpen])
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null
-      if (event.key === 'Escape') {
-        if (episodesOpen) {
-          event.preventDefault()
-          event.stopImmediatePropagation()
-          setEpisodesOpen(false)
-          return
-        }
-        if (immersive || document.fullscreenElement) {
-          event.preventDefault()
-          event.stopImmediatePropagation()
-          void exitImmersive()
-        }
+  // 键盘处理用 ref 载荷:监听器只挂载一次,不被每秒的时间更新牵着重新挂载。
+  const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => {})
+  keyHandlerRef.current = (event: KeyboardEvent) => {
+    const target = event.target as HTMLElement | null
+    if (event.key === 'Escape') {
+      if (episodesOpen) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        setEpisodesOpen(false)
         return
       }
-      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
-      if (event.code === 'Space') {
+      if (immersive || document.fullscreenElement) {
         event.preventDefault()
-        media.toggle()
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault()
-        media.seek(media.time + 10)
-      } else if (event.key === 'ArrowLeft') {
-        event.preventDefault()
-        media.seek(media.time - 10)
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault()
-        changeVolume(0.05)
-      } else if (event.key === 'ArrowDown') {
-        event.preventDefault()
-        changeVolume(-0.05)
-      } else if (event.key.toLowerCase() === 'm') {
-        setMuted((value) => !value)
-      } else if (event.key.toLowerCase() === 'f') {
-        event.preventDefault()
-        void toggleFullscreen()
+        event.stopImmediatePropagation()
+        void exitImmersive()
       }
+      return
     }
+    if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
+    if (event.code === 'Space') {
+      event.preventDefault()
+      media.toggle()
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault()
+      media.seek(media.time + 10)
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault()
+      media.seek(media.time - 10)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      changeVolume(0.05)
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      changeVolume(-0.05)
+    } else if (event.key.toLowerCase() === 'm') {
+      setMuted((value) => !value)
+    } else if (event.key.toLowerCase() === 'f') {
+      event.preventDefault()
+      void toggleFullscreen()
+    }
+  }
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => keyHandlerRef.current(event)
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  })
+  }, [])
 
   const enterImmersive = () => {
     setImmersive(true)
@@ -671,12 +756,6 @@ export default function Theater({
             ref={media.videoRef}
             playsInline
             preload="metadata"
-          />
-          <DanmakuLayer
-            items={danmakuItems}
-            time={media.time}
-            playing={isPlaying}
-            enabled={danmakuOn && danmakuItems.length > 0}
           />
           <div className="theater-vignette" aria-hidden />
           <div className="theater-grain" aria-hidden />
@@ -797,7 +876,9 @@ export default function Theater({
             </span>
             <h3>{t('player.errorTitle')}</h3>
             <p>{errorMessage(activeError)}</p>
-            {activeError.detail && <p className="theater-error-detail">{activeError.detail}</p>}
+            {activeError.detail && language === 'zh' && (
+              <p className="theater-error-detail">{activeError.detail}</p>
+            )}
             <div className="theater-error-actions">
               <button type="button" className="theater-action theater-action--primary" onClick={onRetry}>
                 {t('player.retry')}
@@ -908,16 +989,6 @@ export default function Theater({
             </div>
 
             <div className="dock-tools">
-              <button
-                type="button"
-                className={cx('dock-btn', 'dock-danmaku', danmakuOn && 'is-active')}
-                aria-label={danmakuOn ? t('player.danmakuOff') : t('player.danmakuOn')}
-                aria-pressed={danmakuOn}
-                title={danmakuOn ? t('player.danmakuOff') : t('player.danmakuOn')}
-                onClick={onToggleDanmaku}
-              >
-                <MessageSquareText size={18} />
-              </button>
               <div className="volume" ref={volumeRef}>
                 <button
                   type="button"
@@ -1016,49 +1087,65 @@ export default function Theater({
             </button>
           </div>
 
-          {lines.length > 0 && (
-            <div className="line-tabs" role="tablist" aria-label={t('player.lineLabel')}>
-              {lines.map((line, index) => {
-                const playable = isPlayableLine(line)
-                const active = index === activeLineIndex
-                const probeLine = probe?.lines.find((item) => item.lineIndex === index)
-                const qualityLabel = probeLine && probeLine.height > 0 ? `${probeLine.height}P` : ''
+          {lineTabs.length > 0 && (
+            <div ref={lineTabsRef} className="line-tabs" role="tablist" aria-label={t('player.lineLabel')}>
+              {lineTabs.map((tab) => {
+                const qualityLabel =
+                  tab.probeLine && tab.probeLine.height > 0 ? `${tab.probeLine.height}P` : ''
                 const speedLabel =
-                  probeLine && probeLine.ok && probeLine.speedKbps > 0
-                    ? formatSpeed(probeLine.speedKbps)
+                  tab.probeLine && tab.probeLine.ok && tab.probeLine.speedKbps > 0
+                    ? formatSpeed(tab.probeLine.speedKbps)
                     : ''
-                const meta = !playable
-                  ? t('player.lineUnsupported')
-                  : probeLine
-                    ? [
-                        probeLine.recommended ? t('player.recommended') : '',
-                        qualityLabel,
-                        probeLine.ok ? speedLabel : t('player.probeFailed'),
-                      ]
-                        .filter(Boolean)
-                        .join(' · ')
+                const episodeLabel =
+                  tab.episodeCount > 0
+                    ? t('player.lineEpisodes', { count: tab.episodeCount })
                     : ''
+                // 正在播放的线路以真实播放状态为准,不显示"探测失败"。
+                const probeMeta = tab.active
+                  ? [t('player.playingNow'), qualityLabel].filter(Boolean).join(' · ')
+                  : tab.probeLine
+                    ? tab.probeLine.ok
+                      ? [
+                          tab.probeLine.recommended ? t('player.recommended') : '',
+                          qualityLabel,
+                          speedLabel,
+                        ]
+                          .filter(Boolean)
+                          .join(' · ')
+                      : t('player.probeFailed')
+                    : ''
+                const meta = [
+                  !tab.playable ? t('player.lineUnsupported') : probeMeta,
+                  episodeLabel,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')
                 return (
                   <button
-                    key={`${line.name}-${index}`}
+                    key={`${tab.sourceKey}-${tab.lineIndex}-${tab.lineName}`}
                     type="button"
                     role="tab"
-                    aria-selected={active}
-                    disabled={!playable}
-                    title={[sourceName, line.name, meta, probeLine?.error ?? '']
+                    aria-selected={tab.active}
+                    disabled={!tab.playable || tab.active}
+                    title={[tab.sourceName, tab.lineName, meta, tab.probeLine?.error ?? '']
                       .filter(Boolean)
                       .join(' · ')}
                     className={cx(
                       'line-tab',
-                      active && 'is-active',
-                      !playable && 'is-disabled',
+                      tab.active && 'is-active',
+                      !tab.playable && 'is-disabled',
                     )}
                     onClick={() => {
-                      if (index !== activeLineIndex) onSwitchLine(index)
+                      if (tab.active) return
+                      if (tab.sourceKey && tab.sourceKey !== playback.sourceKey) {
+                        onSwitchToLine(tab.sourceKey, tab.lineIndex)
+                      } else {
+                        onSwitchLine(tab.lineIndex)
+                      }
                     }}
                   >
                     <span>
-                      {[sourceName, line.name || `${t('player.lineLabel')} ${index + 1}`]
+                      {[tab.sourceName, tab.lineName || `${t('player.lineLabel')} ${tab.lineIndex + 1}`]
                         .filter(Boolean)
                         .join(' · ')}
                     </span>

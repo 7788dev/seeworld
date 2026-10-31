@@ -1,6 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod anich;
 mod douban;
 mod play;
 mod play_proxy;
@@ -29,8 +28,6 @@ fn main() {
             play::play_search,
             play::play_detail,
             play::play_resolve,
-            anich::anime_danmaku,
-            anich::set_network_proxy,
         ])
         .register_asynchronous_uri_scheme_protocol("dbimg", |_app, request, responder| {
             tauri::async_runtime::spawn(async move {
