@@ -8,6 +8,9 @@ import {
   mergeSourceLines,
   sourceFromTitleId,
   sourceTypeIsSeries,
+  episodeIdForIndex,
+  episodeNumberOf,
+  withTimeout,
 } from './play'
 import type { PlayDetail, PlayFormat, PlayLine, PlayLineFormat, PlaySearchItem } from './play'
 import type { Title } from './data'
@@ -123,6 +126,29 @@ describe('rankCandidates', () => {
     const ranked = rankCandidates(title, items)
     expect(ranked).toHaveLength(2)
     expect(ranked[0].vodId).toBe('9')
+  })
+
+  it('年份未知（豆瓣列表 year=0）时只接受全名，拒绝包含匹配', () => {
+    const title = makeTitle({ name: '流浪地球', year: 0 })
+    const ambiguous = [makeItem({ name: '流浪地球 大结局', vodId: 'spin' })]
+    expect(rankCandidates(title, ambiguous)).toHaveLength(0)
+    const exact = [
+      makeItem({ name: '流浪地球', vodId: 'exact' }),
+      makeItem({ name: '流浪地球 大结局', vodId: 'spin' }),
+    ]
+    expect(rankCandidates(title, exact).map((item) => item.vodId)).toEqual(['exact'])
+  })
+})
+
+describe('withTimeout', () => {
+  it('按时完成会返回结果并清理定时器', async () => {
+    await expect(withTimeout(Promise.resolve(7), 50, '不应超时')).resolves.toBe(7)
+  })
+
+  it('超时会拒绝并携带可读标签', async () => {
+    await expect(
+      withTimeout(new Promise<never>(() => undefined), 5, '测试超时'),
+    ).rejects.toMatchObject({ code: 'load-failed', message: '测试超时' })
   })
 })
 
@@ -255,5 +281,40 @@ describe('mergeSourceLines', () => {
     ])
     expect(merged[0].sourceKey).toBe('a')
     expect(merged[0].sourceName).toBe('A源')
+  })
+})
+
+describe('episodeIdForIndex', () => {
+  const series = (count: number) =>
+    makeTitle({
+      name: '示例剧',
+      mediaType: 'series',
+      episodes: Array.from({ length: count }, (_, index) => ({
+        id: `db-1-s1e${index + 1}`,
+        season: 1,
+        number: index + 1,
+        name: `第${index + 1}集`,
+        runtime: '45m',
+        synopsis: '',
+      })),
+    })
+
+  it('片库内有该集时复用片库 id', () => {
+    expect(episodeIdForIndex(series(24), 4)).toBe('db-1-s1e5')
+  })
+
+  it('源集数超出片库时生成稳定 id，而不是回退到别的集', () => {
+    const title = series(24)
+    const id = episodeIdForIndex(title, 29)
+    expect(id).toBe('db-1-s1e30')
+    // 关键：必须能反解出集号，否则续看会定位到错误的集。
+    expect(episodeNumberOf(title, id)).toBe(30)
+    expect(episodeNumberOf(title, episodeIdForIndex(title, 39)!)).toBe(40)
+  })
+
+  it('电影没有分集 id，非法索引返回 undefined', () => {
+    expect(episodeIdForIndex(makeTitle({ name: '电影' }), 0)).toBeUndefined()
+    expect(episodeIdForIndex(series(5), -1)).toBeUndefined()
+    expect(episodeIdForIndex(series(5), Number.NaN)).toBeUndefined()
   })
 })

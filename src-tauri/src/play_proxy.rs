@@ -969,6 +969,10 @@ pub async fn handle(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u
     let Some(source) = play::source_by_key(&app, &source_key) else {
         return error_response(404, "unknown play source");
     };
+    // 与 play_search/detail/resolve 保持一致：禁用源不应再通过代理取流。
+    if !source.enabled {
+        return error_response(403, "play source disabled");
+    }
     let upstream = match Url::parse(&raw_url) {
         Ok(url) => url,
         Err(_) => return error_response(400, "invalid upstream url"),
@@ -1101,10 +1105,17 @@ pub async fn handle(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u
     }
     let content_type = upstream_content_type.unwrap_or_else(|| guess_content_type(&upstream));
     let body = bytes.to_vec();
+    // 206 分段响应不能带可缓存头：同一 URL 的不同 Range 若被 WebView2 缓存，
+    // 后续分段可能命中错误内容，表现为花屏/解码失败。整段 200 才允许缓存。
+    let cache_control = if status.as_u16() == 206 {
+        "no-store"
+    } else {
+        "public, max-age=3600"
+    };
     let mut builder = cors_headers(Response::builder().status(status.as_u16()))
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .header(header::CACHE_CONTROL, cache_control)
         .header(header::CONTENT_LENGTH, body.len().to_string());
     if let Some(content_range) = content_range {
         builder = builder.header(header::CONTENT_RANGE, content_range);

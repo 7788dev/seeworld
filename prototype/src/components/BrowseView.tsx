@@ -9,6 +9,7 @@ import {
   RefreshCw,
   SearchX,
   Settings,
+  Trash2,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -21,6 +22,7 @@ import { cx, isDesktopApp, usePersistentState } from '../lib'
 import type { PlaySourceInfo } from '../play'
 import type { PlaybackProgress } from '../types'
 import FilterBar from './FilterBar'
+import PosterSkeleton from './PosterSkeleton'
 import TitleCard from './TitleCard'
 
 interface BrowseViewProps {
@@ -141,6 +143,27 @@ function EmptyState({
   )
 }
 
+const DATA_ACTIONS = [
+  {
+    key: 'progress',
+    labelKey: 'settings.clearProgress',
+    descKey: 'settings.clearProgressDesc',
+    storageKeys: ['jj-progress'],
+  },
+  {
+    key: 'lists',
+    labelKey: 'settings.clearLists',
+    descKey: 'settings.clearListsDesc',
+    storageKeys: ['jj-my-list', 'jj-watch-later', 'jj-liked'],
+  },
+  {
+    key: 'cache',
+    labelKey: 'settings.clearCache',
+    descKey: 'settings.clearCacheDesc',
+    storageKeys: ['jj-title-cache', 'jj-feed-cache', 'jj-play-match', 'jj-explore-filters'],
+  },
+] as const
+
 function SettingsPanel({
   sources,
   autoplayNext,
@@ -152,6 +175,15 @@ function SettingsPanel({
 }) {
   const { language, setLanguage, t } = useI18n()
   const [version, setVersion] = useState('')
+  // 破坏性操作一律二次确认：第一次点击只进入 armed 状态，4 秒后自动撤销。
+  const [pending, setPending] = useState<string | null>(null)
+  const [done, setDone] = useState(false)
+
+  useEffect(() => {
+    if (!pending) return
+    const timer = window.setTimeout(() => setPending(null), 4000)
+    return () => window.clearTimeout(timer)
+  }, [pending])
 
   useEffect(() => {
     if (!isDesktopApp) return
@@ -258,6 +290,52 @@ function SettingsPanel({
           ) : (
             <p className="settings-empty">{t('settings.sourcesUnavailable')}</p>
           )}
+        </section>
+
+        <section className="account-card account-data">
+          <div className="account-language-intro">
+            <span className="account-language-icon">
+              <Trash2 size={18} aria-hidden />
+            </span>
+            <div>
+              <h2>{t('settings.data')}</h2>
+              <p>{t('settings.dataDesc')}</p>
+            </div>
+          </div>
+          <div className="settings-toggles">
+            {DATA_ACTIONS.map((action) => (
+              <button
+                key={action.key}
+                type="button"
+                className={cx('settings-toggle', 'settings-toggle--danger', pending === action.key && 'is-armed')}
+                onClick={() => {
+                  if (pending !== action.key) {
+                    setPending(action.key)
+                    return
+                  }
+                  for (const storageKey of action.storageKeys) {
+                    try {
+                      localStorage.removeItem(storageKey)
+                    } catch {
+                      // storage may be unavailable
+                    }
+                  }
+                  setDone(true)
+                  setPending(null)
+                  window.setTimeout(() => window.location.reload(), 350)
+                }}
+              >
+                <span className="settings-toggle-copy">
+                  <strong>{t(action.labelKey)}</strong>
+                  <em>{pending === action.key ? t('settings.confirmAgain') : t(action.descKey)}</em>
+                </span>
+                <span className="settings-toggle-state">
+                  {pending === action.key ? '!' : ''}
+                </span>
+              </button>
+            ))}
+          </div>
+          {done && <p className="settings-empty">{t('settings.clearedReloading')}</p>}
         </section>
 
         <section className="account-card account-about">
@@ -403,7 +481,10 @@ export default function BrowseView({
     const onScroll = () => tryLoad()
     scroller?.addEventListener('scroll', onScroll, { passive: true })
     window.addEventListener('scroll', onScroll, { passive: true })
-    const interval = window.setInterval(tryLoad, 1200)
+    // 兜底轮询只用于补 IntersectionObserver 的触发时序；2s 足够，且后台标签不空转。
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') tryLoad()
+    }, 2000)
     return () => {
       cancelled = true
       observer.disconnect()
@@ -472,9 +553,8 @@ export default function BrowseView({
       )}
 
       {!filtersActive && isDoubanView && feed.loading && feedItems.length === 0 && (
-        <div className="feed-status" role="status">
-          <Loader2 className="feed-spinner" size={20} aria-hidden />
-          {t('common.loading')}
+        <div role="status" aria-label={t('common.loading')}>
+          <PosterSkeleton count={12} />
         </div>
       )}
 
@@ -488,9 +568,8 @@ export default function BrowseView({
       )}
 
       {filtersActive && explore.loading && (
-        <div className="feed-status" role="status">
-          <Loader2 className="feed-spinner" size={20} aria-hidden />
-          {t('common.loading')}
+        <div role="status" aria-label={t('common.loading')}>
+          <PosterSkeleton count={12} />
         </div>
       )}
 

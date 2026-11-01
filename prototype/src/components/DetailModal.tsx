@@ -24,6 +24,7 @@ import {
   titleSynopsis,
 } from '../content'
 import type { Episode, Title } from '../data'
+import { episodesOf } from '../douban'
 import { useI18n } from '../i18n'
 import { isDesktopApp } from '../lib'
 import {
@@ -36,7 +37,7 @@ import {
 } from '../play'
 import { useFocusTrap } from '../useFocusTrap'
 import { stripHtml } from '../lib'
-import { cx, isPortraitImage, percentage } from '../lib'
+import { cx, isPortraitImage, onImageError, percentage } from '../lib'
 import type { PlaybackProgress } from '../types'
 
 interface DetailModalProps {
@@ -133,7 +134,7 @@ export default function DetailModal({
   const [portraitId, setPortraitId] = useState<string | null>(null)
   const portraitHero = portraitId === title.id
   const progressPct = progress ? percentage(progress.current, progress.duration) : 0
-  const episodes = title.episodes ?? []
+  const episodes = episodesOf(title)
   const savedEpisode = useMemo(() => {
     if (progress?.episodeId) {
       const byId = episodes.find((episode) => episode.id === progress.episodeId)
@@ -196,12 +197,19 @@ export default function DetailModal({
           <img
             ref={heroRef}
             className="detail-hero-art"
-            src={title.hero ?? title.poster}
+            src={title.hero ?? title.poster ?? undefined}
             alt=""
             onLoad={(event) => detectPortrait(event.currentTarget)}
+            onError={onImageError}
           />
           {portraitHero && (
-            <img className="detail-poster" src={title.poster} alt="" aria-hidden />
+            <img
+              className="detail-poster"
+              src={title.poster || undefined}
+              alt=""
+              aria-hidden
+              onError={onImageError}
+            />
           )}
           <div className="detail-hero-shade" aria-hidden />
           <button
@@ -241,7 +249,11 @@ export default function DetailModal({
           <div className="detail-actions">
             <button type="button" className="btn btn--play" onClick={() => onPlay(title.id)}>
               <Play size={17} fill="currentColor" strokeWidth={0} aria-hidden />
-              {progressPct > 0 ? t('detail.resume') : t('detail.play')}
+              {progress?.finished
+                ? t('detail.replay')
+                : progressPct > 0
+                  ? t('detail.resume')
+                  : t('detail.play')}
             </button>
             <button
               type="button"
@@ -365,7 +377,7 @@ export default function DetailModal({
                       onClick={() => onPlay(title.id, episode)}
                     >
                       <span className="detail-episode-thumb">
-                        <img src={title.poster} alt="" />
+                        <img src={title.poster || undefined} alt="" onError={onImageError} />
                         <span>
                           <Play size={12} fill="currentColor" strokeWidth={0} />
                         </span>
@@ -401,7 +413,7 @@ export default function DetailModal({
                     className="related-card"
                     onClick={() => onOpenRelated(item.id)}
                   >
-                    <img src={item.poster} alt="" />
+                    <img src={item.poster || undefined} alt="" onError={onImageError} />
                     <span className="related-shade" aria-hidden />
                     <span className="related-copy">
                       <span className="related-top">

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type HlsJs from 'hls.js'
 import type { PlayErrorInfo, PlayTarget } from '../play'
+import { FINISHED_EPSILON_SEC } from '../lib'
 
 export type MediaPhase =
   | 'idle'
@@ -44,10 +45,12 @@ export interface HlsPlayerController {
   quality: string | null
   error: PlayErrorInfo | null
   usingProxy: boolean
+  rate: number
   play: () => void
   pause: () => void
   toggle: () => void
   seek: (seconds: number) => void
+  setRate: (rate: number) => void
   retry: () => void
   retryOnProxy: () => void
 }
@@ -109,6 +112,8 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
   const [usingProxy, setUsingProxy] = useState(false)
   const [attempt, setAttempt] = useState(0)
   const [proxyNonce, setProxyNonce] = useState(0)
+  const [rate, setRateState] = useState(1)
+  const rateRef = useRef(1)
   const forceProxyRef = useRef(false)
 
   callbacksRef.current = options.callbacks ?? {}
@@ -241,7 +246,7 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
       const total = finiteDuration(video)
       if (total <= 0) return
       const desired = lastKnownTime
-      if (!(desired > 0) || desired > total - 5) {
+      if (!(desired > 0) || desired > total - FINISHED_EPSILON_SEC) {
         // Near the end (or unknown): start over rather than ending instantly.
         pendingRestore = false
         return
@@ -286,6 +291,12 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
       const total = finiteDuration(video)
       setDuration(total)
       updateResolution()
+      // 换集/换源会重建 media，浏览器把 playbackRate 重置成 1，这里恢复用户选择的倍速。
+      try {
+        video.playbackRate = rateRef.current
+      } catch {
+        // ignore unsupported rates
+      }
       applyStartTime()
     }
 
@@ -701,6 +712,20 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     setAttempt((current) => current + 1)
   }, [])
 
+  const setRate = useCallback((next: number) => {
+    if (!Number.isFinite(next)) return
+    const clamped = Math.min(2, Math.max(0.5, next))
+    rateRef.current = clamped
+    setRateState(clamped)
+    const video = videoRef.current
+    if (!video) return
+    try {
+      video.playbackRate = clamped
+    } catch {
+      // ignore unsupported rates
+    }
+  }, [])
+
   const retryOnProxy = useCallback(() => {
     forceProxyRef.current = true
     setProxyNonce((current) => current + 1)
@@ -715,10 +740,12 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     quality,
     error,
     usingProxy,
+    rate,
     play,
     pause,
     toggle,
     seek,
+    setRate,
     retry,
     retryOnProxy,
   }

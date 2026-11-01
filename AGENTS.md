@@ -21,7 +21,7 @@ Tauri 2 桌面应用：Rust 后端 + React 19 / Vite 前端（`prototype/`），
   - **无限瀑布流**：分类页滚动到底由 `BrowseView` 的 sentinel 触发 `loadFeedNext`（各 part 独立游标追加，追加结果回写缓存）。豆瓣请求失败返回 `null` 时不判定到底；连续 3 轮无新增才标记 exhausted。豆瓣 recommend 流翻页可能返回重复内容，属源行为。
 - **播放源**（`src-tauri/resources/play-sources.json`，用户可用 `%APPDATA%/com.jianjie.desktop/play-sources.json` 覆盖）：
   - 7 个影视 CMS 源：dyttzy/ffzy 核心（时长指纹广告过滤）+ lzi/bfzy/jyzy/piaoling2 备用池；jszy 保持禁用（封皮错配）。广告过滤 `adFilter: safe` 内置于 jjstream 代理（`play_proxy.rs` 的 AD_KEYWORDS + 时长指纹 + 安全阈值）。
-  - **搜索多页**：CMS 源按 `pagecount` 最多拉 4 页（修搜索结果不全）；搜索总预算 2.5s，慢源转后台写缓存。前端搜索 = 豆瓣联想 + 播放源全源并发聚合（`ps-` 条目注册进片库）。
+  - **搜索多页**：CMS 源按 `pagecount` 最多拉 4 页（修搜索结果不全）；搜索总预算 2.5s，首个可用结果到达后再等 `SEARCH_MERGE_WINDOW=1000ms` 收拢其余源（250ms 时只等得到一个源），慢源转后台写缓存。前端搜索 = 豆瓣联想 + 播放源全源并发聚合（`ps-` 条目注册进片库）。**单字只发豆瓣联想，≥2 字符才触发全源搜索**，避免逐字输入打出 7 源 × 4 页的请求风暴。
 - **jjstream 代理**（`play_proxy.rs`）：
   - URL 形如 `http://jjstream.localhost/{key}/{url}?k={token}`，token 每次启动随机生成（`play.rs::proxy_token`），无 token 请求一律 403。
   - HLS 播放列表重写 URI 全部走代理；按线路广告过滤（`adRules` 支持 `adDurationFingerprints`、`dropUniqueHostBlocks`、`dropShortBlocks`、`maxDropRatio`），HLS 广告源需强制走 jjstream 才生效。指纹只删命中分片，前后正片保留。
@@ -31,6 +31,9 @@ Tauri 2 桌面应用：Rust 后端 + React 19 / Vite 前端（`prototype/`），
   - probe 评分为速度主导（speed 0.7 / 稳定 0.2 / 质量 0.1），自动选最优线路；probe 只读详情缓存不发网络。
   - 自动换源仅三种触发：启动无帧（3s 代理重试 → 进度感知延长 → 换线/源）、单次冻结 60s、5 分钟内 ≥3 次真实（>1s）卡顿。亚秒抖动与用户 seek 引起的加载不计数。
   - **实时播放位置走 `liveTimeRef`**（Theater 每秒上报、不触发 React 渲染）；React state 里的 `playback.current` 仅按 5s 节流与关键节点更新。换集/换线时 Theater 通过 effect cleanup 快照旧集的 `episodeId/episodeIndex` 补发最终进度，App 按 episodeId 对账落库，防止旧集进度写到新集。
+  - **进度落库节流 60s**（`PROGRESS_FLUSH_MS`）：Theater 每 5s 上报，若每次都写 `progressMap`，整页卡片会陪跑重渲染。关闭播放器 / 暂停 / 结束 / 换集前强制 flush，最坏丢 60s。`progressFor` 只读 `progressMap`，不读 `playback.current`。
+  - **集 id 必须稳定**：`episodeIdForIndex` 在源集数超出豆瓣集数时按 `${title.id}-s1eN` 生成，**不允许回退成"当前集 id"**——回退会让第 30 集的进度覆盖第 5 集，续看跳错集。
+  - `play_resolve` 优先读 detail 缓存（命中即续期），缓存缺失时回源一次：看完一集（45min）后自动连播，30min 的 TTL 早已到期，直接报错会被当成"源不可用"而误换源。
   - `preferredLine` 必须按 `detail.lines` 重新校验可播放，避免 probe 的旧索引选中网页线路。
 - i18n：`i18n.tsx` 中 en/zh 双字典，新文案必须同时补两处。
 - 持久化统一走 `lib.ts` 的 `usePersistentState`（key 前缀 `jj-`）。

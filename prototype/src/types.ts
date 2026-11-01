@@ -38,4 +38,5 @@ export interface PlaybackProgress {
   // Source episode index, persisted so resume still works when Title.episodes is not loaded yet.
   episodeIndex?: number
   updatedAt?: number
+  finished?: boolean
 }

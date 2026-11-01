@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tauri::http::{header, Request, Response};
 
 const LIST_HOSTS: [&str; 2] = [
@@ -16,6 +18,11 @@ const REFERER: &str = "https://movie.douban.com/";
 const M_REFERER: &str = "https://m.douban.com/";
 const IMG_REFERER: &str = "https://movie.douban.com/explore";
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// 一次豆瓣命令的总预算：官方与反代对冲，谁先返回可用 JSON 用谁。
+/// 不能让两个 10s 超时串行叠加，冷启动等 20-30s 是不可接受的。
+const FETCH_BUDGET: Duration = Duration::from_secs(8);
+const DETAIL_BUDGET: Duration = Duration::from_secs(8);
+const WARM_TIMEOUT: Duration = Duration::from_secs(3);
 const LIST_TTL: Duration = Duration::from_secs(600);
 const DETAIL_TTL: Duration = Duration::from_secs(86_400);
 static COOKIE_WARMED: AtomicBool = AtomicBool::new(false);
@@ -105,6 +112,64 @@ fn cache_put(key: String, body: String, ttl: Duration) {
     }
 }
 
+/// 只缓存真正的 JSON（对象/数组）。豆瓣反爬可能返回 200 HTML，
+/// 旧实现会在解析前写缓存，导致后续 10 分钟持续 parse error。
+fn looks_like_json(body: &str) -> bool {
+    matches!(
+        serde_json::from_str::<Value>(body.trim()),
+        Ok(Value::Object(_)) | Ok(Value::Array(_))
+    )
+}
+
+fn warm_cookies_once() {
+    if COOKIE_WARMED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("[douban] warming cookies in background…");
+    // 不等待：暖 Cookie 只是提高官方域名成功率，不能阻塞首屏。
+    tauri::async_runtime::spawn(async move {
+        let _ = client()
+            .get("https://movie.douban.com/")
+            .header(header::REFERER, "https://www.douban.com/")
+            .timeout(WARM_TIMEOUT)
+            .send()
+            .await;
+    });
+}
+
+async fn fetch_from_host(host: String, referer: String, path_query: String) -> Result<String, String> {
+    let started = Instant::now();
+    let url = format!("{host}{path_query}");
+    eprintln!("[douban] GET {url}");
+    let response = client()
+        .get(&url)
+        .header(header::REFERER, referer)
+        .header(header::ACCEPT, "application/json, text/plain, */*")
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| format!("{host}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{host}: HTTP {}", response.status().as_u16()));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("{host}: body read failed: {error}"))?;
+    if body.trim().is_empty() {
+        return Err(format!("{host}: empty body"));
+    }
+    if !looks_like_json(&body) {
+        return Err(format!("{host}: 返回内容不是 JSON（可能被反爬拦截）"));
+    }
+    eprintln!(
+        "[douban] OK {host} {} bytes ({}ms)",
+        body.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(body)
+}
+
 async fn fetch_json(
     key: &str,
     hosts: &[&str],
@@ -115,68 +180,48 @@ async fn fetch_json(
         eprintln!("[douban] cache hit: {key}");
         return Ok(body);
     }
-    let started = std::time::Instant::now();
-    let mut last_error = String::from("all douban hosts failed");
-    for host in hosts {
-        let is_official = host.ends_with("douban.com") && !host.contains("cmliussss");
-        if is_official && !COOKIE_WARMED.swap(true, Ordering::Relaxed) {
-            eprintln!("[douban] warming cookies for official host…");
-            let _ = client()
-                .get("https://movie.douban.com/")
-                .header(header::REFERER, "https://www.douban.com/")
-                .timeout(TIMEOUT)
-                .send()
-                .await;
+    if hosts
+        .iter()
+        .any(|host| host.ends_with("douban.com") && !host.contains("cmliussss"))
+    {
+        warm_cookies_once();
+    }
+    let started = Instant::now();
+    let futures: Vec<BoxFuture<'static, Result<String, String>>> = hosts
+        .iter()
+        .map(|host| {
+            Box::pin(fetch_from_host(
+                host.to_string(),
+                referer.to_string(),
+                path_query.to_string(),
+            )) as BoxFuture<'static, Result<String, String>>
+        })
+        .collect();
+    match tokio::time::timeout(FETCH_BUDGET, futures::future::select_ok(futures)).await {
+        Ok(Ok((body, _remaining))) => {
+            cache_put(key.to_string(), body.clone(), LIST_TTL);
+            eprintln!(
+                "[douban] fetch {key} ok ({} bytes, {}ms)",
+                body.len(),
+                started.elapsed().as_millis()
+            );
+            Ok(body)
         }
-        let url = format!("{host}{path_query}");
-        eprintln!("[douban] GET {url}");
-        let attempt = client()
-            .get(&url)
-            .header(header::REFERER, referer)
-            .header(header::ACCEPT, "application/json, text/plain, */*")
-            .timeout(TIMEOUT)
-            .send()
-            .await;
-        match attempt {
-            Ok(response) if response.status().is_success() => match response.text().await {
-                Ok(body) => {
-                    let trimmed = body.trim();
-                    if trimmed.is_empty() {
-                        eprintln!(
-                            "[douban] {host} returned empty body ({}ms)",
-                            started.elapsed().as_millis()
-                        );
-                        last_error = format!("{host}: empty body");
-                        continue;
-                    }
-                    eprintln!(
-                        "[douban] OK {host} {} bytes ({}ms)",
-                        body.len(),
-                        started.elapsed().as_millis()
-                    );
-                    cache_put(key.to_string(), body.clone(), LIST_TTL);
-                    return Ok(body);
-                }
-                Err(error) => {
-                    eprintln!("[douban] {host} body read failed: {error}");
-                    last_error = format!("{host}: {error}");
-                }
-            },
-            Ok(response) => {
-                eprintln!("[douban] {host} HTTP {}", response.status().as_u16());
-                last_error = format!("{host}: HTTP {}", response.status().as_u16());
-            }
-            Err(error) => {
-                eprintln!("[douban] {host} request failed: {error}");
-                last_error = format!("{host}: {error}");
-            }
+        Ok(Err(error)) => {
+            eprintln!(
+                "[douban] fetch {key} failed after {}ms: {error}",
+                started.elapsed().as_millis()
+            );
+            Err(error)
+        }
+        Err(_) => {
+            eprintln!(
+                "[douban] fetch {key} timed out after {}ms",
+                started.elapsed().as_millis()
+            );
+            Err("豆瓣请求超时（8s）".to_string())
         }
     }
-    eprintln!(
-        "[douban] all hosts failed after {}ms: {last_error}",
-        started.elapsed().as_millis()
-    );
-    Err(last_error)
 }
 
 #[derive(Deserialize)]
@@ -511,6 +556,35 @@ fn parse_detail(body: &str) -> Result<DbDetail, String> {
     })
 }
 
+async fn fetch_detail_from(
+    host: String,
+    endpoint: String,
+    subject_id: String,
+) -> Result<(String, DbDetail), String> {
+    let url = format!("{host}/rexxar/api/v2/{endpoint}/{subject_id}");
+    eprintln!("[douban] detail GET {url}");
+    let response = client()
+        .get(&url)
+        .header(header::REFERER, M_REFERER)
+        .header(header::ACCEPT, "application/json, text/plain, */*")
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| format!("{host}/{endpoint}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{host}/{endpoint}: HTTP {}", response.status().as_u16()));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("{host}/{endpoint}: body read failed: {error}"))?;
+    if body.contains("traversal_error") || body.contains("invalid_request") {
+        return Err(format!("{host}/{endpoint}: subject is not a {endpoint}"));
+    }
+    let detail = parse_detail(&body).map_err(|error| format!("{host}/{endpoint}: {error}"))?;
+    Ok((body, detail))
+}
+
 #[tauri::command]
 pub async fn douban_detail(id: String, kind: Option<String>) -> Result<DbDetail, String> {
     let subject_id = id.trim().trim_start_matches("db-").to_string();
@@ -527,40 +601,25 @@ pub async fn douban_detail(id: String, kind: Option<String>) -> Result<DbDetail,
         "movie"
     };
     let secondary = if primary == "tv" { "movie" } else { "tv" };
-    let mut last_error = String::from("all douban hosts failed");
+    let mut futures: Vec<BoxFuture<'static, Result<(String, DbDetail), String>>> = Vec::new();
     for host in REXXAR_HOSTS {
         for endpoint in [primary, secondary] {
-            let url = format!("{host}/rexxar/api/v2/{endpoint}/{subject_id}");
-            let attempt = client()
-                .get(&url)
-                .header(header::REFERER, M_REFERER)
-                .header(header::ACCEPT, "application/json, text/plain, */*")
-                .timeout(TIMEOUT)
-                .send()
-                .await;
-            match attempt {
-                Ok(response) if response.status().is_success() => match response.text().await {
-                    Ok(body) => {
-                        if body.contains("traversal_error") || body.contains("invalid_request") {
-                            last_error = format!("{host}: subject is not a {endpoint}");
-                            continue;
-                        }
-                        match parse_detail(&body) {
-                            Ok(detail) => {
-                                cache_put(cache_key, body, DETAIL_TTL);
-                                return Ok(detail);
-                            }
-                            Err(error) => last_error = format!("{host}: {error}"),
-                        }
-                    }
-                    Err(error) => last_error = format!("{host}: {error}"),
-                },
-                Ok(response) => last_error = format!("{host}: HTTP {}", response.status().as_u16()),
-                Err(error) => last_error = format!("{host}: {error}"),
-            }
+            futures.push(Box::pin(fetch_detail_from(
+                host.to_string(),
+                endpoint.to_string(),
+                subject_id.clone(),
+            )));
         }
     }
-    Err(last_error)
+    match tokio::time::timeout(DETAIL_BUDGET, futures::future::select_ok(futures)).await {
+        Ok(Ok((body_and_detail, _remaining))) => {
+            let (body, detail) = body_and_detail;
+            cache_put(cache_key, body, DETAIL_TTL);
+            Ok(detail)
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("豆瓣详情请求超时（8s）".to_string()),
+    }
 }
 
 fn split_card_subtitle(raw: &str) -> (String, Vec<String>, String, Vec<String>) {
@@ -741,5 +800,83 @@ pub async fn fetch_image(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
             }
         }
         Err(_) => image_error(502, "failed to fetch douban image"),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_accepts_json_bodies_for_cache() {
+        assert!(looks_like_json(r#"{"subjects":[]}"#));
+        assert!(looks_like_json("  [1,2,3]  "));
+        assert!(!looks_like_json("<html>blocked</html>"));
+        assert!(!looks_like_json(""));
+        assert!(!looks_like_json("null"));
+    }
+
+    #[test]
+    fn splits_recommend_card_subtitle() {
+        let (region, genres, creator, cast) =
+            split_card_subtitle("电影 / 中国大陆 / 科幻 冒险 / 郭帆 / 吴京 屈楚萧");
+        assert_eq!(region, "中国大陆");
+        assert_eq!(genres, vec!["科幻", "冒险"]);
+        assert_eq!(creator, "郭帆");
+        assert_eq!(cast, vec!["吴京", "屈楚萧"]);
+    }
+
+    #[test]
+    fn resolves_dbimg_url_forms() {
+        let expected = Some("https://img1.doubanio.com/a.jpg".to_string());
+        assert_eq!(
+            resolve_image_url("dbimg://localhost/https%3A%2F%2Fimg1.doubanio.com%2Fa.jpg"),
+            expected
+        );
+        assert_eq!(
+            resolve_image_url("http://dbimg.localhost/https%3A%2F%2Fimg1.doubanio.com%2Fa.jpg"),
+            expected
+        );
+        assert_eq!(
+            resolve_image_url("dbimg://img1.doubanio.com/a.jpg"),
+            expected
+        );
+        assert_eq!(resolve_image_url("https://img1.doubanio.com/a.jpg"), None);
+    }
+
+    #[test]
+    fn parses_detail_fields() {
+        let body = r#"{
+          "id": "123",
+          "title": "流浪地球",
+          "type": "movie",
+          "year": "2019",
+          "rating": {"value": 7.9, "count": 1000},
+          "genres": ["科幻"],
+          "actors": [{"name": "吴京"}],
+          "directors": [{"name": "郭帆"}],
+          "intro": "简介",
+          "pic": {"large": "https://x/l.jpg", "normal": "https://x/n.jpg"},
+          "durations": ["125分钟"],
+          "episodes_count": "0",
+          "pubdate": ["2019-02-05"],
+          "countries": ["中国大陆"],
+          "aka": ["The Wandering Earth"],
+          "card_subtitle": "电影 / 中国大陆 / 科幻 / 郭帆 / 吴京"
+        }"#;
+        let detail = parse_detail(body).unwrap();
+        assert_eq!(detail.id, "123");
+        assert_eq!(detail.title, "流浪地球");
+        assert_eq!(detail.kind, "movie");
+        assert_eq!(detail.year, "2019");
+        assert_eq!(detail.rating, 7.9);
+        assert_eq!(detail.actors, vec!["吴京"]);
+        assert_eq!(detail.directors, vec!["郭帆"]);
+        assert_eq!(detail.episodes_count, 0);
+        assert_eq!(detail.countries, vec!["中国大陆"]);
+    }
+
+    #[test]
+    fn rejects_detail_without_identity() {
+        assert!(parse_detail(r#"{"id":"","title":""}"#).is_err());
     }
 }

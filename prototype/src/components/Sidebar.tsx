@@ -21,8 +21,10 @@ interface SidebarProps {
   active: ViewKey
   query: string
   open: boolean
+  composing: boolean
   onNavigate: (view: ViewKey) => void
   onQuery: (query: string) => void
+  onCompositionChange: (composing: boolean) => void
   onClose: () => void
 }
 
@@ -45,8 +47,10 @@ export default function Sidebar({
   active,
   query,
   open,
+  composing,
   onNavigate,
   onQuery,
+  onCompositionChange,
   onClose,
 }: SidebarProps) {
   const { t } = useI18n()
@@ -83,7 +87,10 @@ export default function Sidebar({
             placeholder={t('search.placeholder')}
             aria-label={t('search.aria')}
             value={query}
+            aria-busy={composing}
             onChange={(event) => onQuery(event.target.value)}
+            onCompositionStart={() => onCompositionChange(true)}
+            onCompositionEnd={() => onCompositionChange(false)}
           />
           {query && (
             <button

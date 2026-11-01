@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { SyntheticEvent } from 'react'
 
 export const cx = (...parts: Array<string | false | null | undefined>) =>
   parts.filter(Boolean).join(' ')
@@ -21,7 +22,9 @@ export function usePersistentState<T>(
   key: string,
   initial: T,
   normalize?: (value: unknown) => T,
+  options: { debounceMs?: number } = {},
 ) {
+  const debounceMs = options.debounceMs ?? 0
   const [value, setValue] = useState<T>(() => {
     try {
       const stored = localStorage.getItem(key)
@@ -33,13 +36,32 @@ export function usePersistentState<T>(
     }
   })
 
+  const valueRef = useRef(value)
+  valueRef.current = value
+
+  const write = useCallback(
+    (next: T) => {
+      try {
+        localStorage.setItem(key, JSON.stringify(next))
+      } catch {
+        // storage can be unavailable in private browsing
+      }
+    },
+    [key],
+  )
+
   useEffect(() => {
-    try {
-      localStorage.setItem(key, JSON.stringify(value))
-    } catch {
-      // storage can be unavailable in private browsing
+    // 高频值（音量滑块、播放进度）不必每帧写盘：防抖后写一次。
+    if (debounceMs <= 0) {
+      write(value)
+      return
     }
-  }, [key, value])
+    const timer = window.setTimeout(() => write(valueRef.current), debounceMs)
+    return () => window.clearTimeout(timer)
+  }, [debounceMs, value, write])
+
+  // 卸载时补写尚未落盘的防抖值，避免"拖到 40% 直接关播放器"丢设置。
+  useEffect(() => () => write(valueRef.current), [write])
 
   return [value, setValue] as const
 }
@@ -54,3 +76,21 @@ export const stripHtml = (value: string) =>
 
 export const percentage = (current: number, duration: number) =>
   Math.min(100, Math.max(0, duration > 0 ? (current / duration) * 100 : 0))
+
+export const FINISHED_EPSILON_SEC = 5
+
+export const isProgressFinished = (current: number, duration: number) =>
+  duration > 0 && current >= duration - FINISHED_EPSILON_SEC
+
+/**
+ * 海报兜底：豆瓣图床与 CMS 源图经常 404/防盗链。
+ * 加载失败时摘掉 src 并打上 is-image-failed，由 CSS 给一层同色系渐变，
+ * 避免整屏黑块和浏览器默认的裂图图标。
+ */
+export const onImageError = (event: SyntheticEvent<HTMLImageElement>) => {
+  const image = event.currentTarget
+  if (image.dataset.fallback === '1') return
+  image.dataset.fallback = '1'
+  image.classList.add('is-image-failed')
+  image.removeAttribute('src')
+}

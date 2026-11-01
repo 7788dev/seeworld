@@ -9,6 +9,17 @@ use tauri::Manager;
 fn main() {
     eprintln!("[jianjie] app booting, registering commands…");
     tauri::Builder::default()
+        // 单实例必须第一个注册：双开会让两个 WebView 共享同一份 localStorage，
+        // 进度与片单互相覆盖，是明确的数据损坏来源。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        // 记住窗口大小/位置，避免每次启动都回到 1292×864。
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             // 任务栏/窗口图标以运行时设置为准,避免仍然显示旧的 N 图标。
             if let Ok(icon) = tauri::image::Image::from_app_icon_resource(128) {

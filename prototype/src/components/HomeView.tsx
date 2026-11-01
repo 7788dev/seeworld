@@ -3,6 +3,7 @@ import type { Slide, Title, ViewKey } from '../data'
 import type { FeedState } from '../douban'
 import { useI18n } from '../i18n'
 import Hero from './Hero'
+import PosterSkeleton from './PosterSkeleton'
 import TitleCard from './TitleCard'
 
 interface HomeViewProps {
@@ -52,9 +53,8 @@ export default function HomeView({
     return (
       <div className="home-view">
         {feed.loading ? (
-          <div className="feed-status" role="status">
-            <Loader2 className="feed-spinner" size={20} aria-hidden />
-            {t('common.loading')}
+          <div role="status" aria-label={t('common.loading')}>
+            <PosterSkeleton count={12} />
           </div>
         ) : feed.error ? (
           <div className="feed-status feed-status--warn">

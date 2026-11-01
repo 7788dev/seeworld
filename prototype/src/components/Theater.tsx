@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -25,8 +25,9 @@ import {
 } from '../content'
 import { formatTime } from '../data'
 import type { Episode, Title } from '../data'
+import { episodesOf } from '../douban'
 import { useI18n } from '../i18n'
-import { cx, isDesktopApp, percentage, usePersistentState } from '../lib'
+import { cx, isDesktopApp, onImageError, percentage, usePersistentState } from '../lib'
 import { isPlayableEpisode, isPlayableLine, nextPlayableLineIndex, playableLines } from '../play'
 import type { AggregateLine, PlayErrorInfo, PlayProbeLine, PlayProbeResult } from '../play'
 import type { PlaybackState, PlaybackStatus } from '../types'
@@ -63,6 +64,21 @@ interface TheaterProps {
 
 const formatSpeed = (kbps: number) =>
   kbps >= 1024 ? `${(kbps / 1024).toFixed(1)} MB/s` : `${Math.max(1, Math.round(kbps))} KB/s`
+
+/// 倍速档位：点按循环。0.5 对白太慢，2 是长剧刷集的上限。
+const PLAYBACK_RATES: number[] = [0.75, 1, 1.25, 1.5, 2]
+
+/** 线路面板的视图模型：跨源聚合条目 + 当前源线路回退。 */
+interface LineTabView {
+  sourceKey: string
+  sourceName: string
+  lineIndex: number
+  lineName: string
+  playable: boolean
+  episodeCount: number
+  active: boolean
+  probeLine?: PlayProbeLine
+}
 
 const toPlaybackStatus = (phase: MediaPhase): PlaybackStatus | null => {
   switch (phase) {
@@ -114,7 +130,8 @@ export default function Theater({
   const [episodesOpen, setEpisodesOpen] = useState(false)
   const [immersive, setImmersive] = useState(false)
   const [chromeVisible, setChromeVisible] = useState(true)
-  const [hoverPct, setHoverPct] = useState<number | null>(null)
+
+  const [ambientFailed, setAmbientFailed] = useState(false)
   const [online, setOnline] = useState(
     typeof navigator === 'undefined' ? true : navigator.onLine,
   )
@@ -125,14 +142,16 @@ export default function Theater({
       typeof value === 'number' && Number.isFinite(value)
         ? Math.min(1, Math.max(0, value))
         : 0.72,
+    // 滑块拖动时值每秒变几十次，逐次同步写盘会造成可感知卡顿。
+    { debounceMs: 300 },
   )
   const [muted, setMuted] = usePersistentState(
     'jj-player-muted',
     playback.muted,
     (value) => (typeof value === 'boolean' ? value : false),
+    { debounceMs: 300 },
   )
   const hideTimer = useRef<number | null>(null)
-  const stageClickTimer = useRef<number | null>(null)
   const lastPointer = useRef<{ x: number; y: number } | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
   useFocusTrap(rootRef)
@@ -225,6 +244,28 @@ export default function Theater({
     },
   })
 
+  const [rate, setRate] = usePersistentState(
+    'jj-player-rate',
+    1,
+    (value) => (typeof value === 'number' && PLAYBACK_RATES.includes(value) ? value : 1),
+    { debounceMs: 300 },
+  )
+  const cycleRate = () => {
+    const index = PLAYBACK_RATES.indexOf(rate)
+    const next = PLAYBACK_RATES[(index + 1) % PLAYBACK_RATES.length] ?? 1
+    setRate(next)
+    media.setRate(next)
+  }
+  // 挂载时把持久化的倍速应用到新加载的 media 上。
+  useEffect(() => {
+    media.setRate(rate)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    setAmbientFailed(false)
+  }, [title.id])
+
   const targetKey = playback.target
     ? `${playback.target.sourceKey}|${playback.target.lineIndex}|${playback.target.episodeIndex}`
     : 'none'
@@ -254,47 +295,41 @@ export default function Theater({
   const activeLineIndex = playback.lineIndex ?? 0
   const activeLine = lines[activeLineIndex]
   const sourceEpisodes = activeLine?.episodes ?? []
-  const doubanEpisodes = title.episodes ?? []
+  const doubanEpisodes = episodesOf(title)
   const hasSourceEpisodes = sourceEpisodes.length > 0
   const hasEpisodeList = hasSourceEpisodes || doubanEpisodes.length > 0
 
 
   // 线路面板:优先展示跨源聚合结果(每条带源名与集数);聚合未就绪时回退当前源线路。
-  interface LineTabView {
-    sourceKey: string
-    sourceName: string
-    lineIndex: number
-    lineName: string
-    playable: boolean
-    episodeCount: number
-    active: boolean
-    probeLine?: PlayProbeLine
-  }
-  const lineTabs: LineTabView[] =
-    allLines.length > 0
-      ? allLines.map((item) => ({
-          sourceKey: item.sourceKey,
-          sourceName: item.sourceName,
-          lineIndex: item.lineIndex,
-          lineName: item.lineName,
-          playable: item.playable,
-          episodeCount: item.episodeCount,
-          active: item.sourceKey === playback.sourceKey && item.lineIndex === playback.lineIndex,
-          probeLine:
-            item.sourceKey === playback.sourceKey
-              ? probe?.lines.find((entry) => entry.lineIndex === item.lineIndex)
-              : undefined,
-        }))
-      : lines.map((line, index) => ({
-          sourceKey: playback.sourceKey ?? '',
-          sourceName: sourceName ?? '',
-          lineIndex: index,
-          lineName: line.name,
-          playable: isPlayableLine(line),
-          episodeCount: line.episodes.length,
-          active: index === activeLineIndex,
-          probeLine: probe?.lines.find((entry) => entry.lineIndex === index),
-        }))
+  // useMemo：time 每秒变化会让整个组件重渲染，这层计算不该陪跑。
+  const lineTabs: LineTabView[] = useMemo(
+    () =>
+      allLines.length > 0
+        ? allLines.map((item) => ({
+            sourceKey: item.sourceKey,
+            sourceName: item.sourceName,
+            lineIndex: item.lineIndex,
+            lineName: item.lineName,
+            playable: item.playable,
+            episodeCount: item.episodeCount,
+            active: item.sourceKey === playback.sourceKey && item.lineIndex === playback.lineIndex,
+            probeLine:
+              item.sourceKey === playback.sourceKey
+                ? probe?.lines.find((entry) => entry.lineIndex === item.lineIndex)
+                : undefined,
+          }))
+        : lines.map((line, index) => ({
+            sourceKey: playback.sourceKey ?? '',
+            sourceName: sourceName ?? '',
+            lineIndex: index,
+            lineName: line.name,
+            playable: isPlayableLine(line),
+            episodeCount: line.episodes.length,
+            active: index === activeLineIndex,
+            probeLine: probe?.lines.find((entry) => entry.lineIndex === index),
+          })),
+    [activeLineIndex, allLines, lines, playback.lineIndex, playback.sourceKey, probe, sourceName],
+  )
 
   // 线路条横向滑动:鼠标滚轮把垂直滚动转为横向;按住左键拖拽自由滑动,
   // 拖拽后的 click 会被吞掉,避免拖拽误触发线路切换。
@@ -356,8 +391,7 @@ export default function Theater({
     ? doubanEpisodes.find((episode) => episode.id === playback.episodeId)
     : undefined
   const duration = media.duration > 0 ? media.duration : playback.duration
-  const progressPct = percentage(media.time, duration)
-  const bufferPct = percentage(media.buffered, duration)
+
   const isPlaying = media.phase === 'playing'
   const chromeHidden = !chromeVisible
   const localizedName = titleName(title, language)
@@ -385,7 +419,6 @@ export default function Theater({
   useEffect(
     () => () => {
       if (osdTimer.current !== null) window.clearTimeout(osdTimer.current)
-      if (stageClickTimer.current !== null) window.clearTimeout(stageClickTimer.current)
     },
     [],
   )
@@ -440,18 +473,20 @@ export default function Theater({
     media.usingProxy,
     media.retryOnProxy,
   ])
-  const subtitle = currentSourceEpisode
-    ? [activeLine?.name, currentSourceEpisode.name].filter(Boolean).join(' · ')
-    : currentDoubanEpisode
-      ? formatEpisodeLabel(
-          currentDoubanEpisode.season,
-          currentDoubanEpisode.number,
-          episodeName(currentDoubanEpisode, language),
-          language,
-        )
-      : title.mediaType === 'series'
-        ? t('player.series')
-        : t('player.film', { duration: formatRuntimeLabel(title.duration, language) })
+  const filmRuntime = formatRuntimeLabel(title.duration, language)
+  const subtitle =
+    title.mediaType === 'film'
+      ? (filmRuntime ? t('player.film', { duration: filmRuntime }) : mediaLabel('film', language))
+      : currentSourceEpisode
+        ? [activeLine?.name, currentSourceEpisode.name].filter(Boolean).join(' · ')
+        : currentDoubanEpisode
+          ? formatEpisodeLabel(
+              currentDoubanEpisode.season,
+              currentDoubanEpisode.number,
+              episodeName(currentDoubanEpisode, language),
+              language,
+            )
+          : t('player.series')
   const volumeIcon =
     muted || volume === 0 ? VolumeX : volume < 0.55 ? Volume1 : Volume2
 
@@ -696,29 +731,19 @@ export default function Theater({
     }
   }
 
-  const previewSeek = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect()
-    const pct = ((event.clientX - rect.left) / rect.width) * 100
-    setHoverPct(Math.min(100, Math.max(0, pct)))
-  }
 
   // Single click toggles playback; double click toggles fullscreen (YouTube-style:
   // the pending single-click action is cancelled when a double click arrives).
-  const handleStageClick = () => {
+  const handleStageClick = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (!playback.target || showError) return
-    if (stageClickTimer.current !== null) return
-    stageClickTimer.current = window.setTimeout(() => {
-      stageClickTimer.current = null
+    // 单击立即响应（250ms 的"等双击"延迟会让用户以为没点上）。
+    // 双击的第二次 click 带 detail === 2：撤销第一次的 toggle，再进全屏。
+    if (event.detail >= 2) {
       media.toggle()
-    }, 250)
-  }
-
-  const handleStageDoubleClick = () => {
-    if (stageClickTimer.current !== null) {
-      window.clearTimeout(stageClickTimer.current)
-      stageClickTimer.current = null
+      toggleFullscreen()
+      return
     }
-    toggleFullscreen()
+    media.toggle()
   }
 
   const requestClose = () => {
@@ -737,19 +762,26 @@ export default function Theater({
       <div
         className="theater-stage"
         onClick={handleStageClick}
-        onDoubleClick={handleStageDoubleClick}
       >
         <div
           className="theater-ambient"
-          style={{ backgroundImage: `url(${title.hero ?? title.poster})` }}
+          style={
+            !ambientFailed && (title.hero || title.poster)
+              ? { backgroundImage: `url(${title.hero ?? title.poster})` }
+              : undefined
+          }
           aria-hidden
         />
         <div className="theater-screen">
           <img
             className={cx('theater-art', title.hero && 'theater-art--wide')}
-            src={title.hero ?? title.poster}
+            src={title.hero ?? title.poster ?? undefined}
             alt=""
             key={title.id}
+            onError={(event) => {
+              setAmbientFailed(true)
+              onImageError(event)
+            }}
           />
           <video
             className={cx('theater-video', !playback.target && 'is-idle')}
@@ -929,7 +961,11 @@ export default function Theater({
           <div className="dock-row">
             <div className="dock-meta">
               <div className="dock-thumb">
-                <img src={title.hero ?? title.poster} alt="" />
+                <img
+                  src={title.hero ?? title.poster ?? undefined}
+                  alt=""
+                  onError={onImageError}
+                />
                 <span className="dock-thumb-glow" aria-hidden />
               </div>
               <div className="dock-id">
@@ -989,6 +1025,15 @@ export default function Theater({
             </div>
 
             <div className="dock-tools">
+              <button
+                type="button"
+                className={cx('dock-btn', 'rate-btn', rate !== 1 && 'is-active')}
+                aria-label={t('player.rateAria', { rate })}
+                title={t('player.rate')}
+                onClick={cycleRate}
+              >
+                <span className="rate-label">{rate}×</span>
+              </button>
               <div className="volume" ref={volumeRef}>
                 <button
                   type="button"
@@ -1034,37 +1079,12 @@ export default function Theater({
             </div>
           </div>
 
-          <div className="dock-timeline">
-            <span className="dock-time">{formatTime(media.time)}</span>
-            <div
-              className="seek"
-              onPointerMove={previewSeek}
-              onPointerLeave={() => setHoverPct(null)}
-            >
-              <div className="seek-track">
-                <span className="seek-buffer" style={{ width: `${bufferPct}%` }} />
-                <span className="seek-fill" style={{ width: `${progressPct}%` }} />
-                <span className="seek-thumb" style={{ left: `${progressPct}%` }} />
-              </div>
-              {hoverPct !== null && duration > 0 && (
-                <span className="seek-preview" style={{ left: `${hoverPct}%` }}>
-                  {formatTime((hoverPct / 100) * duration)}
-                </span>
-              )}
-              <input
-                className="seek-input"
-                type="range"
-                min={0}
-                max={duration || 0}
-                step={1}
-                value={media.time}
-                aria-label={t('player.seek')}
-                disabled={duration <= 0}
-                onChange={(event) => media.seek(Number(event.target.value))}
-              />
-            </div>
-            <span className="dock-time dock-time--total">{formatTime(duration)}</span>
-          </div>
+          <SeekBar
+            time={media.time}
+            duration={duration}
+            buffered={media.buffered}
+            onSeek={media.seek}
+          />
         </div>
       </div>
 
@@ -1229,6 +1249,63 @@ export default function Theater({
           </div>
         </aside>
       )}
+    </div>
+  )
+}
+/// 时间轴独立成子组件：hover 只重渲染这一小块，
+/// 不再让整个 Theater（含剧集抽屉）跟着鼠标移动重渲染。
+function SeekBar({
+  time,
+  duration,
+  buffered,
+  onSeek,
+}: {
+  time: number
+  duration: number
+  buffered: number
+  onSeek: (seconds: number) => void
+}) {
+  const { t } = useI18n()
+  const [hoverPct, setHoverPct] = useState<number | null>(null)
+  const progressPct = percentage(time, duration)
+  const bufferPct = percentage(buffered, duration)
+  const previewSeek = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect()
+    if (rect.width <= 0) return
+    const pct = ((event.clientX - rect.left) / rect.width) * 100
+    setHoverPct(Math.min(100, Math.max(0, pct)))
+  }
+  return (
+    <div className="dock-timeline">
+      <span className="dock-time">{formatTime(time)}</span>
+      <div
+        className="seek"
+        onPointerMove={previewSeek}
+        onPointerLeave={() => setHoverPct(null)}
+      >
+        <div className="seek-track">
+          <span className="seek-buffer" style={{ width: `${bufferPct}%` }} />
+          <span className="seek-fill" style={{ width: `${progressPct}%` }} />
+          <span className="seek-thumb" style={{ left: `${progressPct}%` }} />
+        </div>
+        {hoverPct !== null && duration > 0 && (
+          <span className="seek-preview" style={{ left: `${hoverPct}%` }}>
+            {formatTime((hoverPct / 100) * duration)}
+          </span>
+        )}
+        <input
+          className="seek-input"
+          type="range"
+          min={0}
+          max={duration || 0}
+          step={1}
+          value={time}
+          aria-label={t('player.seek')}
+          disabled={duration <= 0}
+          onChange={(event) => onSeek(Number(event.target.value))}
+        />
+      </div>
+      <span className="dock-time dock-time--total">{formatTime(duration)}</span>
     </div>
   )
 }

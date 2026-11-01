@@ -205,6 +205,31 @@ export interface PlayMatch {
 const MATCH_KEY = 'jj-play-match'
 const MATCH_TTL = 24 * 60 * 60 * 1000
 const MAX_MATCH_ENTRIES = 512
+/// 单次网络步骤（搜索/详情/解析）上限。避免一个慢源把整次播放拖到分钟级。
+export const RESOLVE_STEP_TIMEOUT_MS = 8_000
+/// 一次播放解析的总预算（含所有候选）。到点直接进入换源/错误态。
+export const RESOLVE_TOTAL_BUDGET_MS = 16_000
+
+export const withTimeout = <T,>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    if (!(ms > 0)) {
+      reject(new PlayRequestError('load-failed', label))
+      return
+    }
+    const timer = globalThis.setTimeout(() => {
+      reject(new PlayRequestError('load-failed', label))
+    }, ms)
+    promise.then(
+      (value) => {
+        globalThis.clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        globalThis.clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
 
 const isPlayMatch = (value: unknown): value is PlayMatch => {
   if (!value || typeof value !== 'object') return false
@@ -220,19 +245,32 @@ const isPlayMatch = (value: unknown): value is PlayMatch => {
   )
 }
 
+/// 会话内内存镜像：readMatch 在播放/详情/探测里会被调用多次，
+/// 每次重新解析 512 条 localStorage 是纯浪费。
+let matchCache: Record<string, PlayMatch> | null = null
+
 const readMatches = (): Record<string, PlayMatch> => {
+  if (matchCache) return matchCache
   try {
     const stored = localStorage.getItem(MATCH_KEY)
-    if (!stored) return {}
+    if (!stored) {
+      matchCache = {}
+      return matchCache
+    }
     const parsed: unknown = JSON.parse(stored)
-    if (!parsed || typeof parsed !== 'object') return {}
-    return Object.fromEntries(
+    if (!parsed || typeof parsed !== 'object') {
+      matchCache = {}
+      return matchCache
+    }
+    matchCache = Object.fromEntries(
       Object.entries(parsed as Record<string, unknown>).filter((entry): entry is [string, PlayMatch] =>
         isPlayMatch(entry[1]),
       ),
     )
+    return matchCache
   } catch {
-    return {}
+    matchCache = {}
+    return matchCache
   }
 }
 
@@ -257,27 +295,31 @@ export const readMatch = (titleId: string): PlayMatch | null => {
 }
 
 export const writeMatch = (titleId: string, match: Omit<PlayMatch, 'updatedAt'>) => {
+  const matches: Record<string, PlayMatch> = {
+    ...readMatches(),
+    [titleId]: { ...match, updatedAt: Date.now() },
+  }
+  const now = Date.now()
+  const entries = Object.entries(matches)
+    .filter(([, entry]) => now - entry.updatedAt <= MATCH_TTL)
+    .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
+  if (entries.length > MAX_MATCH_ENTRIES) {
+    entries.splice(0, entries.length - MAX_MATCH_ENTRIES)
+  }
+  matchCache = Object.fromEntries(entries)
   try {
-    const matches = readMatches()
-    matches[titleId] = { ...match, updatedAt: Date.now() }
-    const now = Date.now()
-    const entries = Object.entries(matches)
-      .filter(([, entry]) => now - entry.updatedAt <= MATCH_TTL)
-      .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
-    if (entries.length > MAX_MATCH_ENTRIES) {
-      entries.splice(0, entries.length - MAX_MATCH_ENTRIES)
-    }
-    localStorage.setItem(MATCH_KEY, JSON.stringify(Object.fromEntries(entries)))
+    localStorage.setItem(MATCH_KEY, JSON.stringify(matchCache))
   } catch {
     // match cache is an optimization only
   }
 }
 
 export const clearMatch = (titleId: string) => {
+  const matches: Record<string, PlayMatch> = { ...readMatches() }
+  delete matches[titleId]
+  matchCache = matches
   try {
-    const matches = readMatches()
-    delete matches[titleId]
-    localStorage.setItem(MATCH_KEY, JSON.stringify(matches))
+    localStorage.setItem(MATCH_KEY, JSON.stringify(matchCache))
   } catch {
     // ignore
   }
@@ -362,11 +404,14 @@ export function rankCandidates(title: Title, items: PlaySearchItem[]): PlaySearc
     .filter((name): name is string => Boolean(name))
     .map(normalizeName)
   const year = title.year
+  const yearKnown = year > 0
   const scored = items.map((item) => {
     const itemName = normalizeName(item.name)
     const exact = Boolean(itemName) && names.includes(itemName)
     // 搜索接口是模糊匹配，名称对不上的结果（同名电影、动画、解说等）宁可判为无源。
-    if (!exact && !matchTitleName(title, item.name)) {
+    // 年份未知（豆瓣列表接口 year=0）时只接受全名匹配：此时无法用年份区分同名翻拍，
+    // 再允许“包含匹配”会把《流浪地球》匹配到《流浪地球：飞跃地球》这类不同作品。
+    if (!exact && (!yearKnown || !matchTitleName(title, item.name))) {
       return { item, score: Number.NEGATIVE_INFINITY, nameScore: 0 }
     }
     const nameScore = exact ? 100 : 60
@@ -438,8 +483,20 @@ export const episodeNumberOf = (title: Title, episodeId?: string): number | unde
   return match ? Number(match[1]) : undefined
 }
 
-export const episodeIdForIndex = (title: Title, index: number): string | undefined =>
-  title.episodes?.find((episode) => episode.number === index + 1)?.id
+/**
+ * 为源线路的第 index 集生成稳定 episodeId。
+ *
+ * 源站集数常多于豆瓣（豆瓣标 24 集、源给 40 集）。此时片库里查不到第 25 集的 id，
+ * 若调用方回退成"当前集 id"，第 30 集的进度会覆盖第 5 集，续看直接跳错集。
+ * 因此超出片库范围时按 `-s1eN` 规则生成——`episodeNumberOf` 能反解出集号，
+ * 与 `placeholderEpisodes` / DetailModal 的 id 规则保持一致。
+ */
+export const episodeIdForIndex = (title: Title, index: number): string | undefined => {
+  if (!Number.isFinite(index) || index < 0) return undefined
+  const existing = title.episodes?.find((episode) => episode.number === index + 1)?.id
+  if (existing) return existing
+  return title.mediaType === 'series' ? `${title.id}-s1e${index + 1}` : undefined
+}
 
 /* ---------------------------- aggregate lines ----------------------------- */
 
@@ -494,6 +551,8 @@ export async function aggregateSourceLines(
     excludeSourceKeys?: string[]
     maxSources?: number
     sourceNames?: Record<string, string>
+    /// 已经解析出的详情（当前正在播放的源）：直接纳入聚合，避免再搜一遍、再拉一遍详情。
+    seedDetails?: PlayDetail[]
   } = {},
 ): Promise<{ lines: AggregateLine[]; sourceErrors: string[] }> {
   const excluded = new Set(options.excludeSourceKeys ?? [])
@@ -504,7 +563,21 @@ export async function aggregateSourceLines(
       ),
     ),
   )
-  if (queries.length === 0) return { lines: [], sourceErrors: [] }
+  const seedDetails = options.seedDetails ?? []
+  const sourceDetails: { detail: PlayDetail; sourceName: string; rank: number }[] = seedDetails.map(
+    (detail) => ({
+      detail,
+      sourceName: options.sourceNames?.[detail.sourceKey] ?? detail.sourceKey,
+      rank: -1,
+    }),
+  )
+  const seedKeys = new Set(seedDetails.map((detail) => `${detail.sourceKey}|${detail.vodId}`))
+  if (queries.length === 0) {
+    return {
+      lines: mergeSourceLines(sourceDetails),
+      sourceErrors: [],
+    }
+  }
   const sourceErrors: string[] = []
   const seenCandidates = new Set<string>()
   let candidates: PlaySearchItem[] = []
@@ -528,13 +601,17 @@ export async function aggregateSourceLines(
       sourceErrors.push(`${query}: ${messageOf(error)}`)
     }
   }
-  if (ranked.length === 0) return { lines: [], sourceErrors }
+  if (ranked.length === 0) {
+    return { lines: mergeSourceLines(sourceDetails), sourceErrors }
+  }
   // 先按源取最佳候选，再截断；否则前 N 条可能全被同一个源占满。
   const bySource = new Map<string, PlaySearchItem>()
   for (const item of ranked) {
     if (!bySource.has(item.sourceKey)) bySource.set(item.sourceKey, item)
   }
-  const picks = [...bySource.entries()].slice(0, options.maxSources ?? 6)
+  const picks = [...bySource.entries()]
+    .filter(([sourceKey, item]) => !seedKeys.has(`${sourceKey}|${item.vodId}`))
+    .slice(0, options.maxSources ?? 6)
   const settled = await Promise.allSettled(
     picks.map(async ([sourceKey, item], index) => {
       const detail = await playDetail(sourceKey, item.vodId)
@@ -545,7 +622,6 @@ export async function aggregateSourceLines(
       }
     }),
   )
-  const sourceDetails: { detail: PlayDetail; sourceName: string; rank: number }[] = []
   settled.forEach((result, index) => {
     if (result.status === 'fulfilled') {
       sourceDetails.push(result.value)
@@ -568,6 +644,9 @@ export interface ResolveSessionOptions {
   /// 已拿到的详情（换线/换集/重试）优先直接使用，避免重复搜索。
   detail?: PlayDetail
   onSourceFailure?: (sourceKey: string, error: unknown) => void
+  /// 单次网络步骤/整次解析预算；默认见 RESOLVE_* 常量。
+  stepTimeoutMs?: number
+  totalBudgetMs?: number
 }
 
 export interface ResolvedSession {
@@ -594,11 +673,11 @@ const resolveFromDetail = async (
       : null
   const line = preferred !== null ? detail.lines[preferred] : playableLines(detail)[0]
   const episodeIndex = line ? playableEpisodeIndex(line, desired) ?? desired : desired
-  const target = await playResolve(
-    detail.sourceKey,
-    detail.vodId,
-    preferred,
-    episodeIndex,
+  const stepTimeout = Math.max(500, options.stepTimeoutMs ?? RESOLVE_STEP_TIMEOUT_MS)
+  const target = await withTimeout(
+    playResolve(detail.sourceKey, detail.vodId, preferred, episodeIndex),
+    stepTimeout,
+    `解析线路「${line?.name ?? '未知'}」超时`,
   )
   return {
     lineIndex: target.lineIndex,
@@ -640,15 +719,32 @@ export async function resolveSession(
       : null)
   const sourceErrors: PlaySourceError[] = []
   const failures: string[] = []
+  const totalBudget = Math.max(1_000, options.totalBudgetMs ?? RESOLVE_TOTAL_BUDGET_MS)
+  const stepLimit = Math.max(500, options.stepTimeoutMs ?? RESOLVE_STEP_TIMEOUT_MS)
+  const startedAt = Date.now()
+  const remaining = () => totalBudget - (Date.now() - startedAt)
+  const timeoutFor = () => Math.max(0, Math.min(stepLimit, remaining()))
+  let budgetExhausted = false
+  const checkBudget = () => {
+    if (remaining() > 0) return true
+    budgetExhausted = true
+    return false
+  }
+  const deadlineDetail = () =>
+    budgetExhausted ? `解析总时限 ${Math.max(1, Math.round(totalBudget / 1000))}s 已到` : ''
 
   if (
+    checkBudget() &&
     options.detail &&
     !excluded.has(options.detail.sourceKey) &&
     (!options.preferredSourceKey || options.detail.sourceKey === options.preferredSourceKey) &&
     options.detail.lines?.some((line) => isPlayableLine(line))
   ) {
     try {
-      const resolved = await resolveFromDetail(options.detail, options)
+      const resolved = await resolveFromDetail(options.detail, {
+        ...options,
+        stepTimeoutMs: timeoutFor(),
+      })
       writeMatch(title.id, {
         sourceKey: options.detail.sourceKey,
         vodId: options.detail.vodId,
@@ -667,11 +763,18 @@ export async function resolveSession(
     matchTitleName(title, cache.matchedName) &&
     // 用户显式指定源(线路面板跨源切换)时,不得被旧 match 缓存抢走。
     (!options.preferredSourceKey || cache.sourceKey === options.preferredSourceKey)
-  if (cacheUsable && cache && !excluded.has(cache.sourceKey)) {
+  if (checkBudget() && cacheUsable && cache && !excluded.has(cache.sourceKey)) {
     try {
-      const detail = await playDetail(cache.sourceKey, cache.vodId)
+      const detail = await withTimeout(
+        playDetail(cache.sourceKey, cache.vodId),
+        timeoutFor(),
+        `加载已匹配源「${cache.sourceKey}」超时`,
+      )
       if (detail.lines?.some((line) => isPlayableLine(line))) {
-        const resolved = await resolveFromDetail(detail, options)
+        const resolved = await resolveFromDetail(detail, {
+          ...options,
+          stepTimeoutMs: timeoutFor(),
+        })
         writeMatch(title.id, {
           sourceKey: detail.sourceKey,
           vodId: detail.vodId,
@@ -698,8 +801,13 @@ export async function resolveSession(
   let ranked: PlaySearchItem[] = []
 
   for (const query of queries) {
+    if (!checkBudget()) break
     try {
-      const response = await playSearch(query)
+      const response = await withTimeout(
+        playSearch(query),
+        timeoutFor(),
+        `搜索「${query}」超过解析时限`,
+      )
       for (const sourceError of response.errors ?? []) sourceErrors.push(sourceError)
       for (const item of response.items ?? []) {
         if (excluded.has(item.sourceKey)) continue
@@ -723,6 +831,7 @@ export async function resolveSession(
     const detail = [
       ...failures,
       ...sourceErrors.map((sourceError) => `${sourceError.sourceKey}: ${sourceError.message}`),
+      deadlineDetail(),
       candidates.length > 0 ? '搜索结果的标题与片名不符，已拒绝自动匹配' : '',
     ]
       .filter(Boolean)
@@ -742,15 +851,23 @@ export async function resolveSession(
   )
   let sawUnsupported = false
   for (const candidate of rankedCandidates) {
+    if (!checkBudget()) break
     try {
-      const detail = await playDetail(candidate.sourceKey, candidate.vodId)
+      const detail = await withTimeout(
+        playDetail(candidate.sourceKey, candidate.vodId),
+        timeoutFor(),
+        `加载「${candidate.sourceKey}」详情超时`,
+      )
       if (!detail.lines?.some((line) => isPlayableLine(line))) {
         failures.push(`${candidate.sourceKey}: 没有可用的 HLS/MP4 线路`)
         sawUnsupported = true
         options.onSourceFailure?.(candidate.sourceKey, new PlayRequestError('unsupported', '没有可用的 HLS/MP4 线路'))
         continue
       }
-      const resolved = await resolveFromDetail(detail, options)
+      const resolved = await resolveFromDetail(detail, {
+        ...options,
+        stepTimeoutMs: timeoutFor(),
+      })
       writeMatch(title.id, {
         sourceKey: detail.sourceKey,
         vodId: detail.vodId,
@@ -765,10 +882,11 @@ export async function resolveSession(
     }
   }
 
+  const finalDetail = [...failures, deadlineDetail()].filter(Boolean).join(' | ') || undefined
   if (sawUnsupported) {
-    throw new PlayRequestError('unsupported', '所有候选线路格式暂不支持', failures.join(' | ') || undefined)
+    throw new PlayRequestError('unsupported', '所有候选线路格式暂不支持', finalDetail)
   }
-  throw new PlayRequestError('no-source', '找到候选但均无法解析播放地址', failures.join(' | ') || undefined)
+  throw new PlayRequestError('no-source', '找到候选但均无法解析播放地址', finalDetail)
 }
 
 export const nextLineIndex = (lineCount: number, current: number) =>

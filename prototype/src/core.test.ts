@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { formatTime, languages } from './data'
+import type { Title } from './data'
 import {
+  episodesOf,
   exploreRequests,
   normalizeDuration,
   placeholderEpisodes,
@@ -9,7 +11,7 @@ import {
   suggestToTitle,
 } from './douban'
 import { sanitizeFilters, isFilterActive, FILTER_DEFAULTS, filterLabel } from './filters'
-import { isPortraitImage, stripHtml, percentage, parseRuntime } from './lib'
+import { isPortraitImage, stripHtml, percentage, parseRuntime, isProgressFinished } from './lib'
 
 describe('formatTime', () => {
   it('格式化时分秒', () => {
@@ -113,6 +115,47 @@ describe('placeholderEpisodes', () => {
   })
 })
 
+const makeSeries = (overrides: Partial<Title> = {}): Title => ({
+  id: 'db-1',
+  name: '示例剧',
+  mediaType: 'series',
+  year: 0,
+  ageRating: '',
+  match: 0,
+  genres: [],
+  synopsis: '',
+  poster: '',
+  titleStyle: 'condensed',
+  titleLines: ['示例剧'],
+  language: '中文',
+  creator: '',
+  cast: [],
+  addedOrder: 0,
+  episodesCount: 24,
+  ...overrides,
+})
+
+describe('episodesOf', () => {
+  it('只在需要时展开占位剧集，并复用同一数组', () => {
+    const title = makeSeries()
+    expect(title.episodes).toBeUndefined()
+    const episodes = episodesOf(title)
+    expect(episodes).toHaveLength(24)
+    expect(episodes[0].id).toBe('db-1-s1e1')
+    expect(title.episodes).toBeUndefined()
+    expect(episodesOf(title)).toBe(episodes)
+  })
+
+  it('已有真实剧集时原样返回；电影返回空数组', () => {
+    const real = [
+      { id: 'db-1-s1e1', season: 1, number: 1, name: '真实第1集', runtime: '45m', synopsis: '' },
+    ]
+    const title = makeSeries({ episodes: real })
+    expect(episodesOf(title)).toBe(real)
+    expect(episodesOf(makeSeries({ mediaType: 'film', episodesCount: 10 }))).toHaveLength(0)
+  })
+})
+
 describe('filters', () => {
   it('sanitizeFilters 拒绝未知 form 并回退默认', () => {
     const config = {
@@ -160,5 +203,14 @@ describe('isPortraitImage', () => {
     expect(isPortraitImage(fakeImage(300, 450))).toBe(true)
     expect(isPortraitImage(fakeImage(1600, 900))).toBe(false)
     expect(isPortraitImage(fakeImage(0, 500))).toBe(false)
+  })
+})
+describe('isProgressFinished', () => {
+  it('片尾 5 秒内才算看完', () => {
+    expect(isProgressFinished(5396, 5400)).toBe(true)
+    expect(isProgressFinished(5400, 5400)).toBe(true)
+    expect(isProgressFinished(5394, 5400)).toBe(false)
+    expect(isProgressFinished(120, 0)).toBe(false)
+    expect(isProgressFinished(0, 0)).toBe(false)
   })
 })

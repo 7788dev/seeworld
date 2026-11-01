@@ -83,6 +83,10 @@ export interface FeedState {
   ids: string[]
   loading: boolean
   error: boolean
+  /// 请求成功但确实没有内容；与“加载失败”区分，避免空态被当成故障。
+  empty?: boolean
+  /// 部分 part/源失败但仍有内容。
+  partial?: boolean
   exhausted?: boolean
 }
 
@@ -173,6 +177,20 @@ export const placeholderEpisodes = (
     runtime,
     synopsis: '',
   }))
+
+/// 占位剧集按需生成：启动时若为每个缓存剧集都同步生成最多 200 集，
+/// 大量剧集条目会拖慢首屏。缓存只需保留 episodesCount，真正打开详情/播放时再展开。
+const lazyEpisodes = new WeakMap<Title, Episode[]>()
+
+export const episodesOf = (title: Title): Episode[] => {
+  if (title.episodes?.length) return title.episodes
+  if (title.mediaType !== 'series' || !title.episodesCount) return []
+  const cached = lazyEpisodes.get(title)
+  if (cached) return cached
+  const episodes = placeholderEpisodes(title.id, title.episodesCount, title.duration ?? '45m')
+  lazyEpisodes.set(title, episodes)
+  return episodes
+}
 
 const rateToNumber = (rate: string) => {
   const value = Number.parseFloat(rate)
@@ -392,10 +410,10 @@ export const applyDetail = (base: Title, detail: DbDetail): Title => {
   const rating = detail.rating > 0 ? detail.rating : base.doubanRating
   const posterSource = detail.picLarge || detail.picNormal || base.poster || ''
   const heroSource = detail.picLarge || detail.picNormal || base.hero || ''
+  // 剧集数交给 episodesCount，由 episodesOf 按需展开，避免详情一到
+  // 就在注册表里生成几十上百个占位对象。
   const episodes: Episode[] =
-    mediaType === 'series' && detail.episodesCount > 0
-      ? placeholderEpisodes(base.id, detail.episodesCount, duration ?? '45m')
-      : (base.episodes ?? [])
+    mediaType === 'series' && detail.episodesCount > 0 ? [] : (base.episodes ?? [])
   const year = Number.parseInt(detail.year, 10)
   return {
     ...base,

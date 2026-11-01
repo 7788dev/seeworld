@@ -13,3 +13,4 @@ release/
 src-tauri/target/
 e2e/artifacts/
 e2e/dev.log
+.workbuddy-ai/

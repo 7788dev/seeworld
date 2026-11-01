@@ -10,7 +10,7 @@ import {
 } from '../content'
 import type { Slide, Title } from '../data'
 import { useI18n } from '../i18n'
-import { cx, isPortraitImage } from '../lib'
+import { cx, isPortraitImage, onImageError } from '../lib'
 
 interface HeroProps {
   featured: Title
@@ -68,15 +68,22 @@ export default function Hero({
         <img
           ref={artRef}
           className="hero-art"
-          src={featured.hero ?? featured.poster}
+          src={featured.hero ?? featured.poster ?? undefined}
           alt=""
           decoding="async"
           fetchPriority="high"
           onLoad={(event) => detectPortrait(event.currentTarget)}
+          onError={onImageError}
         />
         <div className="hero-scrim" aria-hidden />
         {portrait && (
-          <img className="hero-poster" src={featured.poster} alt="" decoding="async" />
+          <img
+            className="hero-poster"
+            src={featured.poster || undefined}
+            alt=""
+            decoding="async"
+            onError={onImageError}
+          />
         )}
 
         <div className="hero-copy">

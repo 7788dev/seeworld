@@ -18,12 +18,16 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 const DETAIL_TIMEOUT: Duration = Duration::from_secs(10);
 /// 搜索命令的总预算：到点先返回已就绪结果，慢源转后台继续，保证 UI 侧 <= 3s。
 const SEARCH_TOTAL_BUDGET: Duration = Duration::from_millis(2500);
-/// 首个可用结果到达后，再收 250ms 内已就绪的源，避免只拿到单源候选。
-const SEARCH_MERGE_WINDOW: Duration = Duration::from_millis(250);
+/// 首个可用结果到达后，再收 1000ms 内已就绪的源。
+/// 250ms 时只等得到一个源，用户会以为"片源就这么少"；1s 能覆盖绝大多数源的 TTFB。
+const SEARCH_MERGE_WINDOW: Duration = Duration::from_millis(1000);
 const PROBE_TTL: Duration = Duration::from_secs(600);
 // 慢源 TTFB 普遍在 2s 以上,线路总超时必须大于 playlist 采样自身的 5s 预算,
 // 否则可播线路会被一律误判为探测失败。
 const PROBE_LINE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 线路探测并发上限：每条线路内部还会并发请求 3 个分片，
+/// 不加限制时 8 条线路同时探测会瞬间打出 30+ 请求，和播放抢带宽。
+const PROBE_MAX_CONCURRENCY: usize = 4;
 const PROBE_SEGMENT_BYTES: usize = 128 * 1024;
 const SEARCH_TTL: Duration = Duration::from_secs(300);
 const DETAIL_TTL: Duration = Duration::from_secs(1800);
@@ -179,7 +183,7 @@ pub struct PlayLine {
     pub episodes: Vec<PlayEpisode>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayDetail {
     pub source_key: String,
@@ -811,11 +815,22 @@ fn parse_detail_value(
             .unwrap_or("响应中没有 list");
         return Err(format!("详情为空：{message}"));
     }
-    let chosen = list
-        .iter()
-        .find(|item| item_vod_id(item).as_deref() == Some(vod_id))
-        .copied()
-        .unwrap_or(list[0]);
+    // 有些 CMS 的 detail 接口会忽略 ids 直接返回列表；此时取 list[0]
+    // 可能把另一部片子当成用户点的那部。多条目且没有精确匹配时必须报错。
+    let chosen = if list.len() == 1 {
+        list[0]
+    } else {
+        list.iter()
+            .find(|item| item_vod_id(item).as_deref() == Some(vod_id))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "详情返回 {} 条，但未找到 vod_id {}，已拒绝自动匹配",
+                    list.len(),
+                    vod_id
+                )
+            })?
+    };
     let raw: RawVod =
         serde_json::from_value(chosen.clone()).map_err(|error| format!("详情字段解析失败：{error}"))?;
     if raw.vod_id.is_empty() && raw.vod_name.is_empty() {
@@ -1663,12 +1678,16 @@ async fn search_source(
     Ok(items)
 }
 
-/// 只读本地详情缓存；`play_resolve` 依赖它做纯本地计算，不发网络请求。
+/// 只读本地详情缓存；`play_resolve` 优先依赖它做纯本地计算。
+/// 命中即续期：连续换集/换线期间，详情不应在播放中途因为 30 分钟 TTL 到期而失效。
 fn cached_detail(source: &SourceConfig, vod_id: &str) -> Option<PlayDetail> {
     let cache_key = format!("detail:{}:{}", source.key, vod_id);
     let body = cache_get(&cache_key)?;
-    let value: Value = serde_json::from_str(&body).ok()?;
-    parse_detail_value(&value, source, vod_id).ok()
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| parse_detail_value(&value, source, vod_id).ok())?;
+    cache_put(cache_key, body, DETAIL_TTL);
+    Some(detail)
 }
 
 async fn fetch_detail(source: &SourceConfig, vod_id: &str) -> Result<PlayDetail, String> {
@@ -1831,11 +1850,16 @@ pub async fn play_probe(
     let mut lines = if playable.is_empty() {
         Vec::new()
     } else {
-        let futures = playable.into_iter().map(|line| {
+        let mut probed: Vec<PlayProbeLine> = futures::stream::iter(playable.into_iter().map(|line| {
             let source = source.clone();
             async move { probe_line(&source, &line).await }
-        });
-        futures::future::join_all(futures).await
+        }))
+        .buffer_unordered(PROBE_MAX_CONCURRENCY)
+        .collect()
+        .await;
+        // buffer_unordered 按完成顺序返回；线路面板需要稳定顺序。
+        probed.sort_by_key(|line| line.line_index);
+        probed
     };
     let recommended = mark_recommended(&mut lines);
     let result = PlayProbeResult {
@@ -2033,10 +2057,15 @@ pub async fn play_resolve(
     if vod_id.is_empty() {
         return Err("缺少 vod_id".to_string());
     }
-    // P0：resolve 只读本地详情缓存，不发网络；前端必须先 play_detail 再 resolve。
-    let detail = cached_detail(&source, vod_id).ok_or_else(|| {
-        "详情尚未加载，请先调用 play_detail 获取线路后再播放".to_string()
-    })?;
+    // P0：resolve 优先读本地详情缓存（纯本地、零延迟）。
+    // 缓存缺失时回源一次：看完一集（45min）后自动连播，30min 的 detail TTL 早已到期，
+    // 若直接报错会被前端当成"源不可用"而触发换源，把好源误判成坏源。
+    let detail = match cached_detail(&source, vod_id) {
+        Some(detail) => detail,
+        None => fetch_detail(&source, vod_id)
+            .await
+            .map_err(|error| format!("详情加载失败：{error}"))?,
+    };
     if detail.lines.is_empty() {
         return Err("该源未返回可播放线路".to_string());
     }
@@ -2341,6 +2370,19 @@ mod tests {
         let detail = parse_detail_value(&value, &test_source(), "2").unwrap();
         assert_eq!(detail.vod_id, "2");
         assert_eq!(detail.name, "right");
+    }
+
+    #[test]
+    fn rejects_ambiguous_detail_list_without_matching_id() {
+        let value = json!({
+            "code": 1,
+            "list": [
+                {"vod_id": 1, "vod_name": "wrong", "vod_play_url": "正片$https://x/1.mp4"},
+                {"vod_id": 2, "vod_name": "also-wrong", "vod_play_url": "正片$https://x/2.mp4"}
+            ]
+        });
+        let error = parse_detail_value(&value, &test_source(), "99").unwrap_err();
+        assert!(error.contains("未找到 vod_id 99"), "{error}");
     }
 
     #[test]

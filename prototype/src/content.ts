@@ -1,4 +1,5 @@
 import type { Episode, Title } from './data'
+import { episodesOf } from './douban'
 import type { Language } from './i18n'
 import { parseRuntime } from './lib'
 
@@ -68,13 +69,13 @@ export const parseEpisodeLabel = (label?: string) => {
 export const episodeFromLabel = (title: Title) => {
   const parsed = parseEpisodeLabel(title.episodeLabel)
   if (!parsed) return undefined
-  return title.episodes?.find(
+  return episodesOf(title).find(
     (episode) => episode.season === parsed.season && episode.number === parsed.number,
   )
 }
 
 export const initialEpisodeFor = (title: Title) =>
-  episodeFromLabel(title) ?? title.episodes?.[0]
+  episodeFromLabel(title) ?? episodesOf(title)[0]
 
 export const titleEpisodeLabel = (title: Title, language: Language) => {
   const episode = episodeFromLabel(title)

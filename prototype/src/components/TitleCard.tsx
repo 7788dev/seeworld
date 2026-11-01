@@ -3,7 +3,7 @@ import { Check, Play, Plus } from 'lucide-react'
 import { mediaLabel, titleGenres, titleName } from '../content'
 import type { Title } from '../data'
 import { useI18n } from '../i18n'
-import { cx, percentage } from '../lib'
+import { cx, onImageError, percentage } from '../lib'
 import type { PlaybackProgress } from '../types'
 
 interface TitleCardProps {
@@ -42,10 +42,11 @@ function TitleCard({
     <article className={cx('poster-card', `poster-card--${variant}`)}>
       <img
         className="card-img"
-        src={title.poster}
+        src={title.poster || undefined}
         alt=""
         loading={priority ? 'eager' : 'lazy'}
         decoding="async"
+        onError={onImageError}
       />
       <div className="card-shade" aria-hidden />
 
@@ -81,6 +82,7 @@ function TitleCard({
           <span className="n-mark">S</span>
           <span>{mediaLabel(title.mediaType, language)}</span>
           {fromSource && <span className="card-source">{t('card.source')}</span>}
+          {progress?.finished && <span className="card-finished">{t('card.finished')}</span>}
         </div>
         <h3 className={titleClass}>
           {title.titleLines.map((line) => (
@@ -102,7 +104,7 @@ function TitleCard({
       </div>
 
       {progress && progressPct > 0 && (
-        <div className="card-progress" aria-hidden>
+        <div className={`card-progress${progress.finished ? ' is-finished' : ''}`} aria-hidden>
           <span style={{ width: `${progressPct}%` }} />
         </div>
       )}
