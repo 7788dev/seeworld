@@ -42,7 +42,7 @@ async function main() {
     if (!candidate) return null
     const [id, value] = candidate
     const title = titles[id]
-    return { id, name: title?.name ?? '', current: Math.round(value.current ?? 0) }
+    return { id, name: title?.name ?? '', current: Math.round(value.current ?? 0), episodeId: value.episodeId ?? '' }
   })
   if (!pick) throw new Error('no db- episode with resume position >= 60s in jj-progress')
   console.log(`[e2e] target: ${pick.id} "${pick.name}" resume≈${pick.current}s`)
@@ -91,6 +91,11 @@ async function main() {
     const video = document.querySelector('.theater-video')
     return video && video.currentTime > 0.5 && !video.paused
   }, null, { timeout: 120_000 })
+  // 新集可能因“每集独立进度”从该集历史位置开始；记录起点，
+  // 断言“保存值没有继承旧集位置”，而不是武断要求从 0 开始。
+  const switchStart = await page.evaluate(
+    () => document.querySelector('.theater-video')?.currentTime ?? 0,
+  )
   await sleep(2500)
   await page.screenshot({ path: 'e2e/artifacts/06-episode-switched.png' })
 
@@ -117,11 +122,15 @@ async function main() {
   // 未修复时 cleanup 快照会把旧集位置(>=30s)写进新集记录,断言失败。
   const target = progress.find((entry) => entry.id === pick.id)
   const NEW_EPISODE_UPPER = 15
-  const ok = target && target.current >= 1 && target.current <= NEW_EPISODE_UPPER
+  const ok =
+    target &&
+    target.current >= 1 &&
+    target.current <= switchStart + NEW_EPISODE_UPPER &&
+    target.episodeId !== pick.episodeId
   record(
     'switched episode progress is fresh (B1)',
     Boolean(ok),
-    `saved current=${target?.current}s episodeId=${target?.episodeId ?? 'n/a'} (expect 1~${NEW_EPISODE_UPPER}s; old episode was ${before.t.toFixed(1)}s)`,
+    `saved current=${target?.current}s episodeId=${target?.episodeId ?? 'n/a'} (new episode started at ${switchStart.toFixed(1)}s; old episode was ${before.t.toFixed(1)}s/${pick.episodeId})`,
   )
 
   await browser.close()

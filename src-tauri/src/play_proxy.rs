@@ -17,6 +17,35 @@ const MAX_PLAYLIST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 /// 大文件(MP4)按段回源:代理需要缓冲响应体,不能一次拉整部影片。
 const MAX_MEDIA_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// 同时处理的代理请求上限:避免播放+预取+图片式突发把内存/上游连接打满。
+const PROXY_MAX_CONCURRENCY: usize = 10;
+
+fn proxy_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(PROXY_MAX_CONCURRENCY))
+}
+
+/// 流式读取 body，边读边限制大小。不能只检查 Content-Length：
+/// 分块传输或服务器忽略 Range 时没有长度，`bytes()` 会先把整个响应拉进内存。
+async fn read_limited(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    if let Some(length) = response.content_length() {
+        if length > limit as u64 {
+            return Err("upstream body too large".to_string());
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "failed to read upstream body".to_string())?
+    {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err("upstream body too large".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 /// 连接层私网拦截:自定义 DNS resolver 在解析结果交给 hyper 之前逐 IP 校验,
 /// 关闭 ensure_public_host 之后、真实 TCP 连接之前的 DNS rebinding 窗口。
@@ -50,6 +79,7 @@ fn build_client(block_private: bool) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .user_agent(PROXY_USER_AGENT)
         .no_gzip()
+        .cookie_store(true)
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 6 {
@@ -973,6 +1003,10 @@ pub async fn handle(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u
     if !source.enabled {
         return error_response(403, "play source disabled");
     }
+    let _permit = match proxy_semaphore().acquire().await {
+        Ok(permit) => permit,
+        Err(_) => return error_response(503, "proxy busy"),
+    };
     let upstream = match Url::parse(&raw_url) {
         Ok(url) => url,
         Err(_) => return error_response(400, "invalid upstream url"),
@@ -1074,18 +1108,13 @@ pub async fn handle(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u
     } else {
         MAX_SEGMENT_BYTES
     };
-    if let Some(length) = upstream_length {
-        if length > limit as u64 {
-            return error_response(502, "upstream body too large");
-        }
-    }
-    let bytes = match response.bytes().await {
+    let bytes = match read_limited(response, limit).await {
         Ok(bytes) => bytes,
-        Err(_) => return error_response(502, "failed to read upstream body"),
+        Err(message) => {
+            eprintln!("[jjstream] {}: {message}", play::safe_url(&upstream));
+            return error_response(502, &message);
+        }
     };
-    if bytes.len() > limit {
-        return error_response(502, "upstream body too large");
-    }
     if playlist_hint || looks_like_m3u8(&bytes) {
         let text = String::from_utf8_lossy(&bytes);
         let rewritten = rewrite_playlist_with_rules(

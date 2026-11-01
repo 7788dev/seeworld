@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
   matchTitleName,
+  matchFitsTitle,
+  matchesSearchQuery,
+  isVariantSearchResult,
+  searchVersionKey,
+  mergeSearchResults,
   rankCandidates,
   isPlayableLine,
   playableEpisodeIndex,
@@ -8,6 +13,7 @@ import {
   mergeSourceLines,
   sourceFromTitleId,
   sourceTypeIsSeries,
+  detailMatchesTitle,
   episodeIdForIndex,
   episodeNumberOf,
   withTimeout,
@@ -316,5 +322,120 @@ describe('episodeIdForIndex', () => {
     expect(episodeIdForIndex(makeTitle({ name: '电影' }), 0)).toBeUndefined()
     expect(episodeIdForIndex(series(5), -1)).toBeUndefined()
     expect(episodeIdForIndex(series(5), Number.NaN)).toBeUndefined()
+  })
+})
+
+describe('search relevance helpers', () => {
+  it('过滤忽略 wd 的 CMS 目录', () => {
+    expect(matchesSearchQuery('三体', '三体')).toBe(true)
+    expect(matchesSearchQuery('三体', '三体 2023')).toBe(true)
+    expect(matchesSearchQuery('zzz不存在qqq', '追踪再现')).toBe(false)
+    expect(matchesSearchQuery('流浪地球', '地球')).toBe(false)
+    expect(matchesSearchQuery('杀', '杀破狼')).toBe(false)
+    expect(isVariantSearchResult('流浪地球[电影解说]')).toBe(true)
+    expect(isVariantSearchResult('流浪地球 预告片')).toBe(true)
+    expect(isVariantSearchResult('流浪地球')).toBe(false)
+  })
+
+  it('同名不同年份/类型生成不同版本键', () => {
+    const series = makeTitle({ name: '三体', year: 2023, mediaType: 'series' })
+    const film = makeTitle({ name: '三体', year: 2023, mediaType: 'film' })
+    const old = makeTitle({ name: '三体', year: 2022, mediaType: 'series' })
+    expect(searchVersionKey(series)).not.toBe(searchVersionKey(film))
+    expect(searchVersionKey(series)).not.toBe(searchVersionKey(old))
+  })
+
+  it('搜索结果保留同名不同年份，源站只保留一个版本', () => {
+    const douban = [
+      makeTitle({ id: 'db-1', name: '三体', year: 2023, mediaType: 'series' }),
+      makeTitle({ id: 'db-2', name: '三体', year: 2022, mediaType: 'series' }),
+    ]
+    const source = [
+      makeTitle({ id: 'ps-a-1', name: '三体', year: 2023, mediaType: 'series' }),
+      makeTitle({ id: 'ps-b-2', name: '三体', year: 2023, mediaType: 'series' }),
+      makeTitle({ id: 'ps-c-3', name: '三体', year: 2024, mediaType: 'film' }),
+    ]
+    const merged = mergeSearchResults(douban, source)
+    expect(merged.map((title) => title.id)).toEqual(['db-1', 'db-2', 'ps-c-3'])
+  })
+})
+
+describe('source type conflict', () => {
+  it('动画片/动画电影不再误判为剧集', () => {
+    expect(sourceTypeIsSeries('动画片')).toBe(false)
+    expect(sourceTypeIsSeries('动画电影')).toBe(false)
+    expect(sourceTypeIsSeries('纪录片')).toBe(false)
+    expect(sourceTypeIsSeries('国产动漫')).toBe(true)
+    expect(sourceTypeIsSeries('动画剧集')).toBe(true)
+  })
+
+  it('电影/剧集明确冲突时拒绝候选', () => {
+    const film = makeTitle({ name: '三体', year: 2023, mediaType: 'film' })
+    const seriesItem = makeItem({ name: '三体', typeName: '国产剧', year: '2023' })
+    expect(rankCandidates(film, [seriesItem])).toHaveLength(0)
+
+    const series = makeTitle({ name: '三体', year: 2023, mediaType: 'series' })
+    const filmItem = makeItem({ name: '三体', typeName: '电影', year: '2023' })
+    expect(rankCandidates(series, [filmItem])).toHaveLength(0)
+  })
+
+  it('同名不同年份（差距 >2）直接拒绝', () => {
+    const title = makeTitle({ name: '流浪地球', year: 2019 })
+    const remake = makeItem({ name: '流浪地球', year: '2024' })
+    expect(rankCandidates(title, [remake])).toHaveLength(0)
+  })
+})
+
+describe('detailMatchesTitle', () => {
+  it('名称、年份、类型都对上才接受', () => {
+    const title = makeTitle({ name: '示例片名', year: 2023 })
+    const detail = makeDetail('lzi', [{ name: '正片', format: 'hls', episodes: 1 }])
+    expect(detailMatchesTitle(title, detail)).toBe(true)
+
+    const wrongYear = { ...detail, year: '2030' }
+    expect(detailMatchesTitle(title, wrongYear)).toBe(false)
+
+    const wrongName = { ...detail, name: '另一部片' }
+    expect(detailMatchesTitle(title, wrongName)).toBe(false)
+
+    const wrongType = { ...detail, typeName: '国产剧' }
+    expect(detailMatchesTitle(makeTitle({ name: '示例片名', year: 2023, mediaType: 'film' }), wrongType)).toBe(false)
+  })
+
+  it('match 缓存校验年份/类型', () => {
+    const title = makeTitle({ name: '示例片名', year: 2023, mediaType: 'series' })
+    expect(
+      matchFitsTitle(title, {
+        sourceKey: 'lzi',
+        vodId: '1',
+        lineIndex: 0,
+        matchedName: '示例片名',
+        year: 2023,
+        mediaType: 'series',
+        updatedAt: Date.now(),
+      }),
+    ).toBe(true)
+    expect(
+      matchFitsTitle(title, {
+        sourceKey: 'lzi',
+        vodId: '1',
+        lineIndex: 0,
+        matchedName: '示例片名',
+        year: 2030,
+        mediaType: 'series',
+        updatedAt: Date.now(),
+      }),
+    ).toBe(false)
+    expect(
+      matchFitsTitle(title, {
+        sourceKey: 'lzi',
+        vodId: '1',
+        lineIndex: 0,
+        matchedName: '示例片名',
+        year: 2023,
+        mediaType: 'film',
+        updatedAt: Date.now(),
+      }),
+    ).toBe(false)
   })
 })

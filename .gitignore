@@ -9,6 +9,7 @@ vibe_images/checks/
 __pycache__/
 *.log
 release/
+release-assets/
 .qoder-collab-runtime/
 src-tauri/target/
 e2e/artifacts/

@@ -3,6 +3,9 @@ import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent }
 import {
   AlertTriangle,
   ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
+  HelpCircle,
   ListVideo,
   Maximize2,
   Minimize2,
@@ -28,7 +31,13 @@ import type { Episode, Title } from '../data'
 import { episodesOf } from '../douban'
 import { useI18n } from '../i18n'
 import { cx, isDesktopApp, onImageError, percentage, usePersistentState } from '../lib'
-import { isPlayableEpisode, isPlayableLine, nextPlayableLineIndex, playableLines } from '../play'
+import {
+  isPlayableEpisode,
+  isPlayableLine,
+  nextPlayableEpisodeIndex,
+  nextPlayableLineIndex,
+  playableLines,
+} from '../play'
 import type { AggregateLine, PlayErrorInfo, PlayProbeLine, PlayProbeResult } from '../play'
 import type { PlaybackState, PlaybackStatus } from '../types'
 import { useHlsPlayer } from '../player/useHlsPlayer'
@@ -128,6 +137,7 @@ export default function Theater({
 }: TheaterProps) {
   const { language, t } = useI18n()
   const [episodesOpen, setEpisodesOpen] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
   const [immersive, setImmersive] = useState(false)
   const [chromeVisible, setChromeVisible] = useState(true)
 
@@ -250,6 +260,36 @@ export default function Theater({
     (value) => (typeof value === 'number' && PLAYBACK_RATES.includes(value) ? value : 1),
     { debounceMs: 300 },
   )
+  const [qualityHeight, setQualityHeight] = usePersistentState<number | 'auto'>(
+    'jj-player-quality',
+    'auto',
+    (value) =>
+      value === 'auto' || (typeof value === 'number' && Number.isFinite(value))
+        ? (value as number | 'auto')
+        : 'auto',
+    { debounceMs: 300 },
+  )
+  const qualityHeights = useMemo(
+    () => Array.from(new Set(media.levels.map((level) => level.height))).sort((a, b) => b - a),
+    [media.levels],
+  )
+  const activeQualityHeight =
+    media.selectedLevel === 'auto'
+      ? 'auto'
+      : media.levels.find((level) => level.index === media.selectedLevel)?.height
+  const qualityValue =
+    activeQualityHeight === 'auto' || !activeQualityHeight ? 'auto' : String(activeQualityHeight)
+  // 换集/换源后 levels 会重建：按“不超过用户选择的高度”重新映射到新线路的 level。
+  useEffect(() => {
+    if (qualityHeight === 'auto') {
+      if (media.selectedLevel !== 'auto') media.setLevel('auto')
+      return
+    }
+    const candidates = [...media.levels].sort((left, right) => left.height - right.height)
+    const target =
+      [...candidates].reverse().find((level) => level.height <= qualityHeight) ?? candidates[0]
+    if (target && media.selectedLevel !== target.index) media.setLevel(target.index)
+  }, [media.levels, media.selectedLevel, media.setLevel, qualityHeight])
   const cycleRate = () => {
     const index = PLAYBACK_RATES.indexOf(rate)
     const next = PLAYBACK_RATES[(index + 1) % PLAYBACK_RATES.length] ?? 1
@@ -265,6 +305,12 @@ export default function Theater({
   useEffect(() => {
     setAmbientFailed(false)
   }, [title.id])
+
+  useEffect(() => {
+    // 播放时关闭最昂贵的整屏 backdrop-filter / 背景动画，把 GPU 留给视频解码。
+    document.documentElement.classList.add('is-theater-open')
+    return () => document.documentElement.classList.remove('is-theater-open')
+  }, [])
 
   const targetKey = playback.target
     ? `${playback.target.sourceKey}|${playback.target.lineIndex}|${playback.target.episodeIndex}`
@@ -297,7 +343,8 @@ export default function Theater({
   const sourceEpisodes = activeLine?.episodes ?? []
   const doubanEpisodes = episodesOf(title)
   const hasSourceEpisodes = sourceEpisodes.length > 0
-  const hasEpisodeList = hasSourceEpisodes || doubanEpisodes.length > 0
+  const hasEpisodeList =
+    title.mediaType === 'series' && (hasSourceEpisodes || doubanEpisodes.length > 0)
 
 
   // 线路面板:优先展示跨源聚合结果(每条带源名与集数);聚合未就绪时回退当前源线路。
@@ -390,9 +437,51 @@ export default function Theater({
   const currentDoubanEpisode = playback.episodeId
     ? doubanEpisodes.find((episode) => episode.id === playback.episodeId)
     : undefined
+  const currentEpisodeIndex = playback.episodeIndex ?? -1
+  const sourcePreviousIndex = hasSourceEpisodes
+    ? (() => {
+        for (let index = currentEpisodeIndex - 1; index >= 0; index -= 1) {
+          if (isPlayableEpisode(sourceEpisodes[index])) return index
+        }
+        return null
+      })()
+    : null
+  const sourceNextIndex = activeLine
+    ? nextPlayableEpisodeIndex(activeLine, Math.max(0, currentEpisodeIndex + 1))
+    : null
+  const doubanCurrentIndex = currentDoubanEpisode
+    ? doubanEpisodes.findIndex((episode) => episode.id === currentDoubanEpisode.id)
+    : -1
+  const doubanPrevious =
+    doubanCurrentIndex > 0 ? doubanEpisodes[doubanCurrentIndex - 1] : undefined
+  const doubanNext =
+    doubanCurrentIndex >= 0 ? doubanEpisodes[doubanCurrentIndex + 1] : undefined
+  const episodeNav = title.mediaType === 'series' && hasEpisodeList
+  const canPreviousEpisode = hasSourceEpisodes
+    ? sourcePreviousIndex !== null
+    : Boolean(doubanPrevious)
+  const canNextEpisode = hasSourceEpisodes ? sourceNextIndex !== null : Boolean(doubanNext)
+  const goPreviousEpisode = () => {
+    if (hasSourceEpisodes) {
+      if (sourcePreviousIndex !== null) onSelectSourceEpisode(sourcePreviousIndex)
+    } else if (doubanPrevious) {
+      onPlayEpisode(doubanPrevious)
+    }
+  }
+  const goNextEpisode = () => {
+    if (hasSourceEpisodes) {
+      if (sourceNextIndex !== null && sourceNextIndex !== currentEpisodeIndex) {
+        onSelectSourceEpisode(sourceNextIndex)
+      }
+    } else if (doubanNext) {
+      onPlayEpisode(doubanNext)
+    }
+  }
   const duration = media.duration > 0 ? media.duration : playback.duration
 
   const isPlaying = media.phase === 'playing'
+  // buffering 时 video 并未暂停：按钮应显示暂停图标，点击才是暂停。
+  const playingOrBuffering = media.phase === 'playing' || media.phase === 'buffering'
   const chromeHidden = !chromeVisible
   const localizedName = titleName(title, language)
   const activeError = playback.error ?? media.error
@@ -575,7 +664,7 @@ export default function Theater({
 
   const releaseChrome = () => {
     clearHideTimer()
-    if (isPlaying && !episodesOpen) {
+    if (isPlaying && !episodesOpen && !helpOpen) {
       hideTimer.current = window.setTimeout(() => setChromeVisible(false), 2800)
     }
   }
@@ -612,7 +701,7 @@ export default function Theater({
   }, [])
 
   useEffect(() => {
-    const canAutoHide = isPlaying && !episodesOpen
+    const canAutoHide = isPlaying && !episodesOpen && !helpOpen
     const scheduleHide = () => {
       clearHideTimer()
       if (!canAutoHide) return
@@ -647,13 +736,19 @@ export default function Theater({
       window.removeEventListener('keydown', reveal)
       clearHideTimer()
     }
-  }, [immersive, isPlaying, episodesOpen])
+  }, [immersive, isPlaying, episodesOpen, helpOpen])
 
   // 键盘处理用 ref 载荷:监听器只挂载一次,不被每秒的时间更新牵着重新挂载。
   const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => {})
   keyHandlerRef.current = (event: KeyboardEvent) => {
     const target = event.target as HTMLElement | null
     if (event.key === 'Escape') {
+      if (helpOpen) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        setHelpOpen(false)
+        return
+      }
       if (episodesOpen) {
         event.preventDefault()
         event.stopImmediatePropagation()
@@ -667,6 +762,7 @@ export default function Theater({
       }
       return
     }
+    if (helpOpen) return
     if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
     if (event.code === 'Space') {
       event.preventDefault()
@@ -911,6 +1007,7 @@ export default function Theater({
             {activeError.detail && language === 'zh' && (
               <p className="theater-error-detail">{activeError.detail}</p>
             )}
+            {sourceName && <p className="theater-error-source">{sourceName}</p>}
             <div className="theater-error-actions">
               <button type="button" className="theater-action theater-action--primary" onClick={onRetry}>
                 {t('player.retry')}
@@ -983,6 +1080,17 @@ export default function Theater({
               >
                 <X size={19} strokeWidth={1.8} />
               </button>
+              {episodeNav && (
+                <button
+                  type="button"
+                  className="dock-btn"
+                  aria-label={t('player.previousEpisode')}
+                  disabled={!canPreviousEpisode}
+                  onClick={goPreviousEpisode}
+                >
+                  <ChevronLeft size={19} strokeWidth={2} />
+                </button>
+              )}
               <button
                 type="button"
                 className="dock-btn"
@@ -994,10 +1102,10 @@ export default function Theater({
               <button
                 type="button"
                 className="dock-play"
-                aria-label={isPlaying ? t('player.pause') : t('player.play')}
+                aria-label={playingOrBuffering ? t('player.pause') : t('player.play')}
                 onClick={() => media.toggle()}
               >
-                {isPlaying ? (
+                {playingOrBuffering ? (
                   <Pause size={21} fill="currentColor" strokeWidth={0} />
                 ) : (
                   <Play size={21} fill="currentColor" strokeWidth={0} />
@@ -1011,6 +1119,17 @@ export default function Theater({
               >
                 <SkipForward size={19} fill="currentColor" strokeWidth={0} />
               </button>
+              {episodeNav && (
+                <button
+                  type="button"
+                  className="dock-btn"
+                  aria-label={t('player.nextEpisode')}
+                  disabled={!canNextEpisode}
+                  onClick={goNextEpisode}
+                >
+                  <ChevronRight size={19} strokeWidth={2} />
+                </button>
+              )}
               <button
                 type="button"
                 className="dock-btn"
@@ -1025,6 +1144,34 @@ export default function Theater({
             </div>
 
             <div className="dock-tools">
+              <button
+                type="button"
+                className={cx('dock-btn', helpOpen && 'is-active')}
+                aria-label={t('player.help')}
+                title={t('player.help')}
+                onClick={() => setHelpOpen((open) => !open)}
+              >
+                <HelpCircle size={18} />
+              </button>
+              {qualityHeights.length > 1 && (
+                <select
+                  className="quality-select"
+                  value={qualityValue}
+                  aria-label={t('player.quality')}
+                  title={t('player.quality')}
+                  onChange={(event) => {
+                    const next = event.target.value
+                    setQualityHeight(next === 'auto' ? 'auto' : Number(next))
+                  }}
+                >
+                  <option value="auto">{t('player.qualityAuto')}</option>
+                  {qualityHeights.map((height) => (
+                    <option key={height} value={height}>
+                      {height}P
+                    </option>
+                  ))}
+                </select>
+              )}
               <button
                 type="button"
                 className={cx('dock-btn', 'rate-btn', rate !== 1 && 'is-active')}
@@ -1248,6 +1395,38 @@ export default function Theater({
             )}
           </div>
         </aside>
+      )}
+
+      {helpOpen && (
+        <div className="theater-help-layer" onClick={() => setHelpOpen(false)}>
+          <div
+            className="theater-help"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('player.helpTitle')}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="theater-help-head">
+              <h2>{t('player.helpTitle')}</h2>
+              <button
+                type="button"
+                className="theater-tool theater-tool--icon"
+                aria-label={t('player.help')}
+                onClick={() => setHelpOpen(false)}
+              >
+                <X size={17} />
+              </button>
+            </div>
+            <dl className="theater-help-list">
+              <div><dt>Space</dt><dd>{t('player.shortcutPlay')}</dd></div>
+              <div><dt>← / →</dt><dd>{t('player.shortcutSeek')}</dd></div>
+              <div><dt>↑ / ↓</dt><dd>{t('player.shortcutVolume')}</dd></div>
+              <div><dt>M</dt><dd>{t('player.shortcutMute')}</dd></div>
+              <div><dt>F</dt><dd>{t('player.shortcutFullscreen')}</dd></div>
+              <div><dt>Esc</dt><dd>{t('player.shortcutClose')}</dd></div>
+            </dl>
+          </div>
+        </div>
       )}
     </div>
   )

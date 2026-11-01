@@ -35,9 +35,35 @@ const CONFIG_TTL: Duration = Duration::from_secs(30);
 const BREAKER_THRESHOLD: u32 = 3;
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_CACHE_ENTRIES: usize = 256;
+/// 搜索/详情/播放列表响应上限。第三方 CMS 返回异常大 body 时不能在内存里无限缓冲。
+const MAX_API_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const BUNDLED_CONFIG: &str = include_str!("../resources/play-sources.json");
 
-#[derive(Deserialize, Clone, Debug, Default)]
+async fn read_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<String, String> {
+    if let Some(length) = response.content_length() {
+        if length > limit as u64 {
+            return Err("响应体过大".to_string());
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("读取响应失败：{}", error.without_url()))?
+    {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err("响应体过大".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SourceHeaders {
     pub(crate) referer: Option<String>,
@@ -45,7 +71,7 @@ pub(crate) struct SourceHeaders {
     pub(crate) origin: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub(crate) struct AdRules {
     /// 删除 discontinuity 分块中的异常短块(中插广告常见形态)。
@@ -78,7 +104,7 @@ impl Default for AdRules {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SourceConfig {
     pub(crate) key: String,
@@ -161,6 +187,8 @@ pub struct PlaySearchItem {
 pub struct PlaySearchResponse {
     pub items: Vec<PlaySearchItem>,
     pub errors: Vec<PlaySourceError>,
+    /// 本次实际查询的源数量；前端据此区分“全部源失败”和“部分源超时/无结果”。
+    pub source_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -836,6 +864,14 @@ fn parse_detail_value(
     if raw.vod_id.is_empty() && raw.vod_name.is_empty() {
         return Err("详情缺少 vod_id/vod_name".to_string());
     }
+    // 部分 CMS 会忽略 ids 返回“仅一条”的其他内容；单条目分支也必须校验 id，
+    // 否则会把另一部片子当成用户点的那部。
+    if !raw.vod_id.is_empty() && raw.vod_id != vod_id {
+        return Err(format!(
+            "详情返回 vod_id {}，与请求的 {} 不一致，已拒绝自动匹配",
+            raw.vod_id, vod_id
+        ));
+    }
     let lines = parse_play_lines(&raw.vod_play_from, &raw.vod_play_url);
     if lines.is_empty() {
         return Err("该源未返回可播放线路（可能只有页面地址）".to_string());
@@ -1129,10 +1165,9 @@ async fn fetch_playlist(source: &SourceConfig, url: &Url) -> Result<(String, Url
         return Err(format!("播放列表 HTTP {}", response.status().as_u16()));
     }
     let final_url = response.url().clone();
-    let text = response
-        .text()
+    let text = read_body_limited(response, MAX_PLAYLIST_BODY_BYTES)
         .await
-        .map_err(|error| format!("播放列表读取失败：{}", error.without_url()))?;
+        .map_err(|error| format!("播放列表读取失败：{error}"))?;
     let text = text.trim_start_matches('\u{feff}').to_string();
     if !text.trim_start().starts_with("#EXTM3U") {
         return Err("首集不是 m3u8（可能是网页）".to_string());
@@ -1608,11 +1643,11 @@ async fn search_source(
         breaker_failure(&source.key);
         return Err(format!("HTTP {status}"));
     }
-    let body = match response.text().await {
+    let body = match read_body_limited(response, MAX_API_BODY_BYTES).await {
         Ok(body) => body,
         Err(error) => {
             breaker_failure(&source.key);
-            return Err(format!("读取响应失败：{}", error.without_url()));
+            return Err(error);
         }
     };
     let value: Value = match serde_json::from_str(&body) {
@@ -1655,7 +1690,7 @@ async fn search_source(
             if !page_response.status().is_success() {
                 break;
             }
-            let Ok(page_body) = page_response.text().await else { break };
+            let Ok(page_body) = read_body_limited(page_response, MAX_API_BODY_BYTES).await else { break };
             let Ok(page_value) = serde_json::from_str::<Value>(&page_body) else { break };
             let Ok(mut page_items) = parse_search_items(&page_value, source) else { break };
             if page_items.is_empty() {
@@ -1743,13 +1778,10 @@ async fn fetch_detail(source: &SourceConfig, vod_id: &str) -> Result<PlayDetail,
             errors.push(format!("{action}: HTTP {}", response.status().as_u16()));
             continue;
         }
-        let body = match response.text().await {
+        let body = match read_body_limited(response, MAX_API_BODY_BYTES).await {
             Ok(body) => body,
             Err(error) => {
-                errors.push(format!(
-                    "{action}: 读取响应失败（{}）",
-                    error.without_url()
-                ));
+                errors.push(format!("{action}: {error}"));
                 continue;
             }
         };
@@ -1814,6 +1846,76 @@ pub async fn play_sources(app: AppHandle) -> Result<Vec<PlaySourceInfo>, String>
             enabled: source.enabled,
         })
         .collect())
+}
+
+/// 在用户 JSON 中只改 enabled，保留他们手写的未知字段。
+fn apply_source_toggle(
+    root: &mut Value,
+    key: &str,
+    enabled: bool,
+    full_source: Value,
+) -> Result<(), String> {
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| "用户播放源配置根节点必须是对象".to_string())?;
+    let sources = object
+        .entry("sources".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let array = sources
+        .as_array_mut()
+        .ok_or_else(|| "用户播放源配置的 sources 必须是数组".to_string())?;
+    if let Some(existing) = array
+        .iter_mut()
+        .find(|entry| entry.get("key").and_then(Value::as_str) == Some(key))
+    {
+        let entry = existing
+            .as_object_mut()
+            .ok_or_else(|| format!("播放源 {key} 的配置必须是对象"))?;
+        entry.insert("enabled".to_string(), Value::Bool(enabled));
+        return Ok(());
+    }
+    let mut source = full_source;
+    let object = source
+        .as_object_mut()
+        .ok_or_else(|| "播放源配置必须是对象".to_string())?;
+    object.insert("enabled".to_string(), Value::Bool(enabled));
+    array.push(source);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn play_set_source_enabled(
+    app: AppHandle,
+    key: String,
+    enabled: bool,
+) -> Result<Vec<PlaySourceInfo>, String> {
+    let source = source_by_key(&app, &key)
+        .ok_or_else(|| format!("未找到播放源：{}", key.trim().to_ascii_lowercase()))?;
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位配置目录：{error}"))?;
+    std::fs::create_dir_all(&dir).map_err(|error| format!("无法创建配置目录：{error}"))?;
+    let path = dir.join("play-sources.json");
+    let mut root: Value = if path.is_file() {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("读取用户播放源配置失败：{error}"))?;
+        serde_json::from_str(&text)
+            .map_err(|error| format!("用户播放源配置不是合法 JSON：{error}"))?
+    } else {
+        serde_json::json!({ "replace": false, "sources": [] })
+    };
+    let full_source = serde_json::to_value(&source)
+        .map_err(|error| format!("播放源配置序列化失败：{error}"))?;
+    apply_source_toggle(&mut root, &source.key, enabled, full_source)?;
+    let text = serde_json::to_string_pretty(&root)
+        .map_err(|error| format!("播放源配置序列化失败：{error}"))?;
+    std::fs::write(&path, text).map_err(|error| format!("写入播放源配置失败：{error}"))?;
+    // 立刻失效配置缓存，下一次 play_sources/搜索/代理都会读到新 enabled。
+    if let Ok(mut guard) = config_cache().lock() {
+        *guard = None;
+    }
+    play_sources(app).await
 }
 
 #[tauri::command]
@@ -1915,6 +2017,7 @@ pub async fn play_search(
         return Ok(PlaySearchResponse {
             items: Vec::new(),
             errors: Vec::new(),
+            source_count: 0,
         });
     }
     let all = load_config(&app);
@@ -1941,8 +2044,10 @@ pub async fn play_search(
         return Ok(PlaySearchResponse {
             items: Vec::new(),
             errors: Vec::new(),
+            source_count: 0,
         });
     }
+    let source_count = sources.len();
     let search_started = Instant::now();
     let mut pending_keys: HashSet<String> = sources
         .iter()
@@ -2027,7 +2132,11 @@ pub async fn play_search(
         errors.len(),
         search_started.elapsed().as_millis()
     );
-    Ok(PlaySearchResponse { items, errors })
+    Ok(PlaySearchResponse {
+        items,
+        errors,
+        source_count,
+    })
 }
 
 #[tauri::command]
@@ -2225,10 +2334,15 @@ mod tests {
     fn cached_detail_reads_local_cache_only() {
         let source = test_source();
         let vod_id = unique_test_key("vod");
-        let body = r#"{"vod_id":42,"vod_name":"cache me","vod_play_url":"正片$https://example.com/a.m3u8"}"#;
+        let body = serde_json::json!({
+            "vod_id": vod_id.clone(),
+            "vod_name": "cache me",
+            "vod_play_url": "正片$https://example.com/a.m3u8"
+        })
+        .to_string();
         cache_put(
             format!("detail:{}:{}", source.key, vod_id),
-            body.to_string(),
+            body,
             DETAIL_TTL,
         );
         let detail = cached_detail(&source, &vod_id).unwrap();
@@ -2370,6 +2484,54 @@ mod tests {
         let detail = parse_detail_value(&value, &test_source(), "2").unwrap();
         assert_eq!(detail.vod_id, "2");
         assert_eq!(detail.name, "right");
+    }
+
+    #[test]
+    fn rejects_single_detail_with_mismatched_vod_id() {
+        let value = json!({
+            "code": 1,
+            "list": [
+                {"vod_id": 1, "vod_name": "wrong", "vod_play_url": "正片$https://x/1.mp4"}
+            ]
+        });
+        let error = parse_detail_value(&value, &test_source(), "2").unwrap_err();
+        assert!(error.contains("不一致"), "{error}");
+    }
+
+    #[test]
+    fn source_toggle_preserves_unknown_user_fields() {
+        let mut root = json!({
+            "version": 2,
+            "replace": false,
+            "custom": {"keep": true},
+            "sources": [{"key": "lzi", "enabled": true, "note": "user-written"}]
+        });
+        let full = json!({"key": "lzi", "name": "x", "api": "https://x", "enabled": false});
+        apply_source_toggle(&mut root, "lzi", false, full).unwrap();
+        assert_eq!(root["custom"]["keep"], true);
+        assert_eq!(root["sources"][0]["note"], "user-written");
+        assert_eq!(root["sources"][0]["enabled"], false);
+    }
+
+    #[test]
+    fn source_toggle_appends_missing_source_as_full_config() {
+        let mut root = json!({"replace": false, "sources": []});
+        let full = json!({"key": "new", "name": "New", "api": "https://x", "enabled": false});
+        apply_source_toggle(&mut root, "new", true, full).unwrap();
+        assert_eq!(root["sources"][0]["key"], "new");
+        assert_eq!(root["sources"][0]["enabled"], true);
+        assert_eq!(root["sources"][0]["api"], "https://x");
+    }
+
+    #[test]
+    fn source_config_roundtrips_through_json() {
+        let source = test_source();
+        let value = serde_json::to_value(&source).unwrap();
+        let parsed: SourceConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.key, source.key);
+        assert_eq!(parsed.api, source.api);
+        assert_eq!(parsed.source_type, "cms");
+        assert!(parsed.enabled);
     }
 
     #[test]

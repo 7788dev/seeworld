@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: clippy
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix prototype ci
+      - name: TypeScript
+        working-directory: prototype
+        run: npx tsc -b
+      - name: Frontend tests
+        run: npm test
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Frontend build
+        run: npm --prefix prototype run build

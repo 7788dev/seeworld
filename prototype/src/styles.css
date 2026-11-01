@@ -4697,3 +4697,164 @@ html.is-window-maximized {
   min-height: 44px;
   color: #9aa094;
 }
+
+/* ===== 播放时降低 GPU 合成成本 ===== */
+.is-theater-open .app-panel {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.is-theater-open .theater-ambient {
+  filter: blur(32px) brightness(0.35) saturate(1.15);
+}
+
+.is-theater-open .theater-art {
+  animation: none;
+}
+
+.search-hint {
+  margin: -8px 0 14px;
+  color: rgba(235, 238, 231, 0.62);
+  font-size: 12px;
+}
+
+.settings-source-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+}
+
+.settings-source-toggle {
+  min-width: 34px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+  color: #9aa094;
+  font: inherit;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.settings-source-toggle.is-on {
+  border-color: rgba(125, 217, 123, 0.45);
+  background: rgba(125, 217, 123, 0.12);
+  color: #b9e8b6;
+}
+
+.settings-source-toggle:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.65);
+  outline-offset: 2px;
+}
+
+.dock-btn:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+
+.dock-btn:disabled:hover {
+  background: rgba(255, 255, 255, 0.05);
+  transform: none;
+}
+
+.quality-select {
+  appearance: none;
+  padding: 5px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: #dfe3da;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.quality-select:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.65);
+  outline-offset: 2px;
+}
+
+.theater-help-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(2, 3, 2, 0.58);
+  backdrop-filter: blur(6px);
+}
+
+.theater-help {
+  width: min(420px, 100%);
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background: rgba(15, 18, 14, 0.94);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  padding: 18px 20px 20px;
+  color: #e8ebe4;
+}
+
+.theater-help-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.theater-help-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.theater-help-list {
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.theater-help-list > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.theater-help-list dt {
+  font-family: 'Anton', monospace;
+  letter-spacing: 0.08em;
+  font-size: 11px;
+  color: #f0dfb8;
+}
+
+.theater-help-list dd {
+  margin: 0;
+  font-size: 11px;
+  color: rgba(235, 238, 231, 0.72);
+  text-align: right;
+}
+
+.theater-error-source {
+  margin: 2px 0 0;
+  color: rgba(235, 238, 231, 0.5);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.detail-source-loading {
+  margin: 0 0 14px;
+  color: rgba(235, 238, 231, 0.55);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+.settings-export-status {
+  word-break: break-all;
+  line-height: 1.6;
+  color: rgba(185, 232, 182, 0.9);
+}

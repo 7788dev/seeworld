@@ -9,12 +9,14 @@ interface SearchViewProps {
   results: Title[]
   busy: boolean
   partialErrors: number
+  error: boolean
   myList: string[]
   progressFor: (id: string) => PlaybackProgress | undefined
   onOpen: (id: string) => void
   onPlay: (id: string) => void
   onToggleList: (id: string) => void
   onClear: () => void
+  onRetry: () => void
 }
 
 export default function SearchView({
@@ -22,12 +24,14 @@ export default function SearchView({
   results,
   busy,
   partialErrors,
+  error,
   myList,
   progressFor,
   onOpen,
   onPlay,
   onToggleList,
   onClear,
+  onRetry,
 }: SearchViewProps) {
   const { t } = useI18n()
 
@@ -37,14 +41,16 @@ export default function SearchView({
         <div className="page-head-copy">
           <p className="eyebrow">{t('search.eyebrow')}</p>
           <h1>{t('search.resultsFor', { query })}</h1>
-          <p className="page-subtitle">
+          <p className="page-subtitle" aria-live="polite">
             {busy
               ? t('search.searching')
-              : results.length === 0
-                ? t('search.noStories')
-                : results.length === 1
-                  ? t('search.foundOne', { count: results.length })
-                  : t('search.foundMany', { count: results.length })}
+              : error && results.length === 0
+                ? t('search.errorTitle')
+                : results.length === 0
+                  ? t('search.noStories')
+                  : results.length === 1
+                    ? t('search.foundOne', { count: results.length })
+                    : t('search.foundMany', { count: results.length })}
           </p>
         </div>
         <button type="button" className="btn btn--glass btn--small" onClick={onClear}>
@@ -52,9 +58,19 @@ export default function SearchView({
         </button>
       </header>
 
+      {query.length > 0 && query.length < 2 && (
+        <p className="search-hint">{t('search.minChars')}</p>
+      )}
+
       {partialErrors > 0 && results.length > 0 && (
         <p className="search-partial" role="status">
           {t('search.partial', { count: partialErrors })}
+        </p>
+      )}
+
+      {error && results.length > 0 && (
+        <p className="search-partial" role="status">
+          {t('search.partialFailure')}
         </p>
       )}
 
@@ -62,6 +78,17 @@ export default function SearchView({
         <div className="feed-status" role="status">
           <Loader2 className="feed-spinner" size={20} aria-hidden />
           {t('search.searching')}
+        </div>
+      ) : results.length === 0 && error ? (
+        <div className="empty-state" role="alert">
+          <span className="empty-icon">
+            <SearchX size={26} />
+          </span>
+          <h2>{t('search.errorTitle')}</h2>
+          <p>{t('search.errorCopy')}</p>
+          <button type="button" className="btn btn--glass" onClick={onRetry}>
+            {t('search.retry')}
+          </button>
         </div>
       ) : results.length === 0 ? (
         <div className="empty-state">

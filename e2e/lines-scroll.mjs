@@ -32,10 +32,12 @@ async function main() {
   }
   await page.waitForSelector('.theater', { timeout: 60_000 })
 
-  // 打开剧集抽屉并等聚合线路
-  await page.mouse.move(640, 100)
-  await sleep(400)
-  await page.locator('.theater-tool', { hasText: /剧集|Episodes/ }).first().click({ force: true })
+  // 打开剧集抽屉并等聚合线路；若抽屉已打开则不要重复点击（点击会关闭）
+  if ((await page.locator('.episode-drawer').count()) === 0) {
+    await page.mouse.move(640, 100)
+    await sleep(400)
+    await page.locator('.theater-tool', { hasText: /剧集|Episodes/ }).first().click({ force: true })
+  }
   await page.waitForSelector('.episode-drawer', { timeout: 10_000 })
   await page.waitForFunction(
     () => document.querySelectorAll('.line-tab').length >= 3,

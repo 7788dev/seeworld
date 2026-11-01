@@ -25,6 +25,7 @@ import {
 } from './douban'
 import type { FeedState } from './douban'
 import { useI18n } from './i18n'
+import { mergeRegisteredTitle } from './library'
 import { cx, isDesktopApp, isProgressFinished, stripHtml, usePersistentState } from './lib'
 import {
   episodeIdForIndex,
@@ -33,7 +34,10 @@ import {
   errorInfoOf,
   isPlayableEpisode,
   isPlayableLine,
-  matchTitleName,
+  isVariantSearchResult,
+  matchesSearchQuery,
+  matchFitsTitle,
+  mergeSearchResults,
   nextPlayableEpisodeIndex,
   playableEpisodeIndex,
   playDetail,
@@ -43,6 +47,7 @@ import {
   playSources,
   readMatch,
   resolveSession,
+  setPlaySourceEnabled,
   sourceTypeIsSeries,
   withTimeout,
 } from './play'
@@ -62,6 +67,7 @@ const TITLE_CACHE_KEY = 'jj-title-cache'
 /// 播放进度落库间隔：5s 太密（整列表跟着重渲染），60s 是"防丢"与"少渲染"的折中。
 const PROGRESS_FLUSH_MS = 60_000
 const FEED_CACHE_KEY = 'jj-feed-cache'
+const FEED_CACHE_PREFIX = 'jj-feed-cache:'
 const FEED_TTL = 5 * 60 * 1000
 const TITLE_CACHE_BUDGET = 2_000_000
 const FEED_EMPTY_ROUNDS_LIMIT = 3
@@ -77,40 +83,59 @@ interface CachedFeed {
   exhausted?: boolean
 }
 
+const parseCachedFeed = (value: unknown): CachedFeed | null => {
+  if (!value || typeof value !== 'object') return null
+  const entry = value as Partial<CachedFeed>
+  if (!Array.isArray(entry.ids)) return null
+  const ids = entry.ids.filter((id): id is string => typeof id === 'string')
+  if (ids.length === 0) return null
+  const offsets =
+    Array.isArray(entry.offsets) &&
+    entry.offsets.length > 0 &&
+    entry.offsets.every((offset) => typeof offset === 'number' && Number.isFinite(offset))
+      ? entry.offsets
+      : undefined
+  return {
+    ids,
+    // 旧缓存没有 offsets，视为过期，强制刷新一次后才能继续翻页。
+    updatedAt:
+      offsets && typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt)
+        ? entry.updatedAt
+        : 0,
+    offsets,
+    exhausted: entry.exhausted === true,
+  }
+}
+
 const readFeedCache = (): Record<string, CachedFeed> => {
+  const result: Record<string, CachedFeed> = {}
+  // 兼容旧的单 key 缓存。
   try {
     const stored = localStorage.getItem(FEED_CACHE_KEY)
-    if (!stored) return {}
-    const parsed: unknown = JSON.parse(stored)
-    if (!parsed || typeof parsed !== 'object') return {}
-    const result: Record<string, CachedFeed> = {}
-    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (!value || typeof value !== 'object') continue
-      const entry = value as Partial<CachedFeed>
-      if (!Array.isArray(entry.ids)) continue
-      const ids = entry.ids.filter((id): id is string => typeof id === 'string')
-      if (ids.length === 0) continue
-      const offsets =
-        Array.isArray(entry.offsets) &&
-        entry.offsets.length > 0 &&
-        entry.offsets.every((offset) => typeof offset === 'number' && Number.isFinite(offset))
-          ? entry.offsets
-          : undefined
-      result[key] = {
-        ids,
-        // 旧缓存没有 offsets，视为过期，强制刷新一次后才能继续翻页。
-        updatedAt:
-          offsets && typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt)
-            ? entry.updatedAt
-            : 0,
-        offsets,
-        exhausted: entry.exhausted === true,
+    if (stored) {
+      const parsed: unknown = JSON.parse(stored)
+      if (parsed && typeof parsed === 'object') {
+        for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+          const entry = parseCachedFeed(value)
+          if (entry) result[key] = entry
+        }
       }
     }
-    return result
   } catch {
-    return {}
+    // ignore corrupt legacy cache
   }
+  // 新格式：每个 feed 独立 key，滚动时只重写当前分类。
+  try {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index)
+      if (!key?.startsWith(FEED_CACHE_PREFIX)) continue
+      const entry = parseCachedFeed(JSON.parse(localStorage.getItem(key) ?? 'null'))
+      if (entry) result[key.slice(FEED_CACHE_PREFIX.length)] = entry
+    }
+  } catch {
+    // ignore corrupt per-feed cache
+  }
+  return result
 }
 
 const cachedFeeds = readFeedCache()
@@ -178,7 +203,7 @@ const migrateCachedTitle = (value: unknown): Title | null => {
     cardTitleSize: ['sm', 'md', 'lg'].includes(String(raw.cardTitleSize))
       ? (raw.cardTitleSize as Title['cardTitleSize'])
       : undefined,
-    language: sanitizeString(raw.language),
+    language: id.startsWith('db-') ? '' : sanitizeString(raw.language),
     creator: sanitizeString(raw.creator),
     cast: sanitizeStrings(raw.cast),
     episodeLabel: typeof raw.episodeLabel === 'string' ? raw.episodeLabel : undefined,
@@ -325,6 +350,21 @@ const asProgressMap = (value: unknown): Record<string, PlaybackProgress> => {
   return Object.fromEntries(entries)
 }
 
+const asEpisodeProgressMap = (
+  value: unknown,
+): Record<string, Record<string, PlaybackProgress>> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([titleId, raw]): [string, Record<string, PlaybackProgress>] | null => {
+      const episodes = asProgressMap(raw)
+      return Object.keys(episodes).length > 0 ? [titleId, episodes] : null
+    })
+    .filter(
+      (entry): entry is [string, Record<string, PlaybackProgress>] => Boolean(entry),
+    )
+  return Object.fromEntries(entries)
+}
+
 const FEED_VIEWS: ViewKey[] = ['new', 'tv', 'movies', 'anime']
 
 const prefetchKey = (titleId: string, lineIndex: number, episodeIndex: number) =>
@@ -352,6 +392,14 @@ export default function App() {
   const updateQuery = useCallback((next: string) => {
     if (!next) setQueryComposing(false)
     setQuery(next)
+    if (next.trim()) {
+      // 搜索页和浏览页共用 .main-scroll；从深滚动位置输入搜索时，
+      // 不重置会把用户带到结果中部，看起来像“没有结果”。
+      window.requestAnimationFrame(() => {
+        const scroller = document.querySelector<HTMLElement>('.main-scroll')
+        if (scroller) scroller.scrollTop = 0
+      })
+    }
   }, [])
 
   const [myList, setMyList] = usePersistentState<string[]>('jj-my-list', [], asStringList)
@@ -378,19 +426,31 @@ export default function App() {
   )
   const progressMapRef = useRef(progressMap)
   progressMapRef.current = progressMap
+  const [episodeProgress, setEpisodeProgress] = usePersistentState<
+    Record<string, Record<string, PlaybackProgress>>
+  >('jj-episode-progress', {}, asEpisodeProgressMap)
+  const episodeProgressRef = useRef(episodeProgress)
+  episodeProgressRef.current = episodeProgress
   const pinnedTitleIds = useMemo(
     // 观看进度里的标题也必须钉住：标题缓存按 2MB 预算裁剪时，
     // 若只保护片单/稍后看，最近观看会在重启后整条消失。
     () => new Set([...myList, ...later, ...liked, ...Object.keys(progressMap)]),
     [myList, later, liked, progressMap],
   )
+  const pinnedTitleIdsRef = useRef(pinnedTitleIds)
+  pinnedTitleIdsRef.current = pinnedTitleIds
 
   const [registry, setRegistry] = useState<Record<string, Title>>(initialRegistry)
+  // 搜索结果里来自 CMS 的条目先放内存镜像；用户真正打开/播放时才写入 registry，
+  // 避免一次搜索把整站目录塞进 2MB 的 jj-title-cache。
+  const transientTitlesRef = useRef<Map<string, Title>>(new Map())
   const [feeds, setFeeds] = useState<Record<string, FeedState>>(initialFeedState)
   const feedUpdatedRef = useRef<Record<string, number>>(cachedFeedTimes)
   const [searchResults, setSearchResults] = useState<Title[]>([])
   const [searchBusy, setSearchBusy] = useState(false)
   const [searchSourceErrors, setSearchSourceErrors] = useState(0)
+  const [searchError, setSearchError] = useState(false)
+  const [searchNonce, setSearchNonce] = useState(0)
   const [probes, setProbes] = useState<Record<string, PlayProbeResult>>({})
   const probesRef = useRef<Record<string, PlayProbeResult>>({})
   useEffect(() => {
@@ -399,6 +459,24 @@ export default function App() {
   const probeFlightsRef = useRef<Set<string>>(new Set())
   const probeTriedRef = useRef<Set<string>>(new Set())
   const [sourceInfos, setSourceInfos] = useState<PlaySourceInfo[]>([])
+  const [sourcesLoaded, setSourcesLoaded] = useState(!isDesktopApp)
+  const [sourcesFailed, setSourcesFailed] = useState(false)
+  const loadSources = useCallback(async () => {
+    if (!isDesktopApp) {
+      setSourcesLoaded(true)
+      return
+    }
+    setSourcesLoaded(false)
+    setSourcesFailed(false)
+    try {
+      const list = await playSources()
+      setSourceInfos(list)
+      setSourcesLoaded(true)
+    } catch {
+      setSourcesFailed(true)
+      setSourcesLoaded(true)
+    }
+  }, [])
   const sourceNames = useMemo(
     () => Object.fromEntries(sourceInfos.map((source) => [source.key, source.name])),
     [sourceInfos],
@@ -413,13 +491,8 @@ export default function App() {
   const aggregateRequestRef = useRef(0)
 
   useEffect(() => {
-    if (!isDesktopApp) return
-    void playSources()
-      .then((list) => {
-        setSourceInfos(list)
-      })
-      .catch(() => undefined)
-  }, [])
+    void loadSources()
+  }, [loadSources])
 
   const feedsRef = useRef<Record<string, FeedState>>({})
   useEffect(() => {
@@ -438,18 +511,16 @@ export default function App() {
 
   const writeFeedCache = useCallback(
     (feedKey: string, ids: string[], offsets: number[], exhausted: boolean) => {
+      const entry: CachedFeed = {
+        ids,
+        updatedAt: Date.now(),
+        offsets,
+        exhausted,
+      }
+      feedCacheRef.current = { ...feedCacheRef.current, [feedKey]: entry }
       try {
-        const next: Record<string, CachedFeed> = {
-          ...feedCacheRef.current,
-          [feedKey]: {
-            ids,
-            updatedAt: Date.now(),
-            offsets,
-            exhausted,
-          },
-        }
-        feedCacheRef.current = next
-        localStorage.setItem(FEED_CACHE_KEY, JSON.stringify(next))
+        // 每个分类独立 key：追加一页只序列化当前分类，不再重写全部分类。
+        localStorage.setItem(`${FEED_CACHE_PREFIX}${feedKey}`, JSON.stringify(entry))
       } catch {
         // feed cache is an optimization only
       }
@@ -459,9 +530,14 @@ export default function App() {
 
   useEffect(() => {
     // 防抖写入:搜索/瀑布流会高频注册条目,全量序列化不能每次都做。
-    const timer = window.setTimeout(() => persistTitleCache(registry, pinnedTitleIds), 800)
+    // 只依赖 registry：progressMap 每 60s 变化时不应触发整库序列化；
+    // pinned 集合通过 ref 读取，写盘时仍然生效。
+    const timer = window.setTimeout(
+      () => persistTitleCache(registry, pinnedTitleIdsRef.current),
+      800,
+    )
     return () => window.clearTimeout(timer)
-  }, [registry, pinnedTitleIds])
+  }, [registry])
 
   const register = useCallback((incoming: Title[]) => {
     if (incoming.length === 0) return
@@ -475,45 +551,11 @@ export default function App() {
           changed = true
           continue
         }
-        // 只有能补齐既有数据缺口时才合并；合并按字段进行，空值不得覆盖已有内容。
-        const improves =
-          (title.synopsis && !existing.synopsis) ||
-          (title.cast.length > 0 && existing.cast.length === 0) ||
-          (title.genres.length > 0 && existing.genres.length === 0) ||
-          (Boolean(title.episodes?.length) && !existing.episodes?.length) ||
-          (Boolean(title.poster) && !existing.poster) ||
-          (Boolean(title.hero) && !existing.hero) ||
-          (Boolean(title.originalName) && !existing.originalName) ||
-          (Boolean(title.region) && !existing.region) ||
-          (Boolean(title.pubdate) && !existing.pubdate) ||
-          (Boolean(title.creator) && !existing.creator) ||
-          (title.year > 0 && existing.year === 0) ||
-          (title.match > 0 && existing.match === 0) ||
-          (title.episodesCount !== undefined && existing.episodesCount === undefined) ||
-          (title.doubanRating !== undefined && existing.doubanRating === undefined) ||
-          (title.doubanVotes !== undefined && existing.doubanVotes === undefined)
-        if (improves) {
-          next[title.id] = {
-            ...existing,
-            ...title,
-            name: title.name || existing.name,
-            originalName: title.originalName || existing.originalName,
-            synopsis: title.synopsis || existing.synopsis,
-            poster: title.poster || existing.poster,
-            hero: title.hero || existing.hero,
-            creator: title.creator || existing.creator,
-            region: title.region || existing.region,
-            pubdate: title.pubdate || existing.pubdate,
-            duration: title.duration || existing.duration,
-            cast: title.cast.length > 0 ? title.cast : existing.cast,
-            genres: title.genres.length > 0 ? title.genres : existing.genres,
-            episodes: title.episodes?.length ? title.episodes : existing.episodes,
-            year: title.year > 0 ? title.year : existing.year,
-            match: title.match > 0 ? title.match : existing.match,
-            doubanRating: title.doubanRating ?? existing.doubanRating,
-            doubanVotes: title.doubanVotes ?? existing.doubanVotes,
-            episodesCount: title.episodesCount ?? existing.episodesCount,
-          }
+        // 只有能补齐既有数据缺口/刷新详情字段时才合并；
+        // 空值不覆盖已有内容，集数取更大值，评分/票数允许更新。
+        const merged = mergeRegisteredTitle(existing, title)
+        if (merged) {
+          next[title.id] = merged
           changed = true
         }
       }
@@ -521,7 +563,10 @@ export default function App() {
     })
   }, [])
 
-  const resolveTitle = useCallback((id: string): Title | undefined => registry[id], [registry])
+  const resolveTitle = useCallback(
+    (id: string): Title | undefined => registry[id] ?? transientTitlesRef.current.get(id),
+    [registry],
+  )
 
   const detailPromisesRef = useRef<Map<string, Promise<Title | null>>>(new Map())
   const detailDoneRef = useRef<Set<string>>(new Set())
@@ -798,8 +843,10 @@ export default function App() {
     const needle = query.trim()
     if (!needle) {
       setSearchResults([])
+      transientTitlesRef.current.clear()
       setSearchBusy(false)
       setSearchSourceErrors(0)
+      setSearchError(false)
       return
     }
     if (queryComposing) {
@@ -808,27 +855,31 @@ export default function App() {
     }
     // 单字只发豆瓣联想（轻量、能补全），不触发 7 源 × 最多 4 页的播放源风暴。
     const wantSourceSearch = needle.length >= 2
-    setSearchResults([])
     setSearchBusy(true)
+    setSearchError(false)
     setSearchSourceErrors(0)
     let cancelled = false
     const timer = window.setTimeout(() => {
       const doubanTitles: Title[] = []
       const sourceTitles: Title[] = []
       let pending = wantSourceSearch ? 2 : 1
+      let doubanFailed = false
+      let sourceFailed = false
+      let sourceErrorCount = 0
+      let sourceCount = 0
       const publish = () => {
         if (cancelled) return
-        const byKey = new Map<string, Title>()
-        const keyOf = (title: Title) => title.originalName || title.name
-        for (const title of doubanTitles) {
-          const key = keyOf(title)
-          if (!byKey.has(key)) byKey.set(key, title)
-        }
-        for (const title of sourceTitles) {
-          const key = keyOf(title)
-          if (!byKey.has(key)) byKey.set(key, title)
-        }
-        setSearchResults([...byKey.values()])
+        const merged = mergeSearchResults(doubanTitles, sourceTitles)
+        // 新查询还没有任何结果时先保留旧结果，等所有分支 settle 再决定空态，
+        // 避免输入过程中列表被清空导致闪烁。
+        if (merged.length === 0 && pending > 0) return
+        transientTitlesRef.current = new Map(merged.map((title) => [title.id, title]))
+        setSearchResults(merged)
+        setSearchError(
+          doubanFailed ||
+            sourceFailed ||
+            (merged.length === 0 && sourceCount > 0 && sourceErrorCount >= sourceCount),
+        )
       }
       const settle = () => {
         if (cancelled) return
@@ -837,29 +888,36 @@ export default function App() {
         publish()
       }
       const mapSourceItems = (items: PlaySearchItem[]) =>
-        items.slice(0, 40).map((item) => {
-          const id = `ps-${item.sourceKey.replace(/-/g, '~')}-${item.vodId}`
-          const typeName = item.typeName || ''
-          return {
-            id,
-            name: item.name,
-            mediaType: sourceTypeIsSeries(typeName) ? 'series' : 'film',
-            year: Number.parseInt(item.year, 10) || 0,
-            ageRating: '',
-            match: 0,
-            genres: typeName ? [typeName] : [],
-            synopsis: item.actor ? `主演：${stripHtml(item.actor)}` : '',
-            poster: sourcePoster(item.pic),
-            titleStyle: 'condensed',
-            titleLines: [item.name],
-            language: item.lang || '',
-            creator: item.director || '',
-            cast: item.actor ? item.actor.split(',').filter(Boolean).slice(0, 4) : [],
-            addedOrder: 0,
-            region: item.area,
-            remarks: item.remarks,
-          } as Title
-        })
+        // CMS 并不都支持 wd（lzi/bfzy 会返回整站目录），必须在展示前过滤。
+        items
+          .filter(
+            (item) =>
+              matchesSearchQuery(needle, item.name) && !isVariantSearchResult(item.name),
+          )
+          .slice(0, 30)
+          .map((item) => {
+            const id = `ps-${item.sourceKey.replace(/-/g, '~')}-${item.vodId}`
+            const typeName = item.typeName || ''
+            return {
+              id,
+              name: item.name,
+              mediaType: sourceTypeIsSeries(typeName) ? 'series' : 'film',
+              year: Number.parseInt(item.year, 10) || 0,
+              ageRating: '',
+              match: 0,
+              genres: typeName ? [typeName] : [],
+              synopsis: item.actor ? `主演：${stripHtml(item.actor)}` : '',
+              poster: sourcePoster(item.pic),
+              titleStyle: 'condensed',
+              titleLines: [item.name],
+              language: item.lang || '',
+              creator: item.director || '',
+              cast: item.actor ? item.actor.split(',').filter(Boolean).slice(0, 4) : [],
+              addedOrder: 0,
+              region: item.area,
+              remarks: item.remarks,
+            } as Title
+          })
       const mergeSourceItems = (items: PlaySearchItem[]) => {
         // 旧 query 的后台补搜不得污染当前结果与片库。
         if (cancelled) return
@@ -867,48 +925,57 @@ export default function App() {
         const extra = mapSourceItems(items).filter((title) => !known.has(title.id))
         if (extra.length === 0) return
         sourceTitles.push(...extra)
-        register(extra)
         publish()
       }
       // 豆瓣联想与播放源搜索并行；任意一方先返回就先展示，不互相阻塞。
       void (async () => {
         try {
-          const suggestions = await fetchDoubanSuggest(needle).catch(() => [])
+          const suggestions = await fetchDoubanSuggest(needle)
           if (cancelled) return
-          doubanTitles.push(...(suggestions ?? []).map(suggestToTitle))
-          register(doubanTitles)
+          if (!suggestions) {
+            doubanFailed = true
+          } else {
+            const mapped = suggestions.map(suggestToTitle)
+            doubanTitles.push(...mapped)
+            register(mapped)
+          }
+        } catch {
+          if (!cancelled) doubanFailed = true
         } finally {
           settle()
         }
       })()
       if (!wantSourceSearch) return
       void (async () => {
-        let errors = 0
         try {
           const response = await playSearch(needle)
           if (cancelled) return
-          errors = response.errors?.length ?? 0
-          setSearchSourceErrors(errors)
+          sourceErrorCount = response.errors?.length ?? 0
+          sourceCount = response.sourceCount ?? 0
+          setSearchSourceErrors(sourceErrorCount)
           sourceTitles.push(...mapSourceItems(response.items ?? []))
-          register(sourceTitles)
           publish()
         } catch {
-          // 桌面端不可用或全部源失败时,仅展示豆瓣结果
+          // 桌面端不可用或全部源失败时，仍展示豆瓣结果，但搜索页要能提示错误。
+          if (!cancelled) sourceFailed = true
         } finally {
           // 先结束 busy：结果已经可见，不能因为补搜让"正在搜索"再挂几秒。
           settle()
         }
-        if (errors === 0 || cancelled) return
+        if (sourceErrorCount === 0 || cancelled) return
         // 慢源转后台写缓存；稍后再查一次，通常能命中缓存补齐结果。
         await new Promise((resolve) => window.setTimeout(resolve, 1200))
         if (cancelled) return
         try {
           const retry = await playSearch(needle)
           if (cancelled) return
-          setSearchSourceErrors(retry.errors?.length ?? 0)
+          sourceErrorCount = retry.errors?.length ?? 0
+          sourceCount = retry.sourceCount ?? sourceCount
+          setSearchSourceErrors(sourceErrorCount)
           mergeSourceItems(retry.items ?? [])
         } catch {
-          // 补搜失败不影响已经展示的结果
+          if (!cancelled) sourceFailed = true
+          publish()
         }
       })()
     }, 350)
@@ -916,13 +983,25 @@ export default function App() {
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [query, queryComposing, register])
+  }, [query, queryComposing, register, searchNonce])
 
   useEffect(() => {
     if (!toast) return
     const timer = window.setTimeout(() => setToast(null), 2800)
     return () => window.clearTimeout(timer)
   }, [toast])
+
+  // localStorage 配额/不可用不应静默丢数据；每个会话只提示一次，避免刷屏。
+  const storageWarnedRef = useRef(false)
+  useEffect(() => {
+    const onStorageError = () => {
+      if (storageWarnedRef.current) return
+      storageWarnedRef.current = true
+      notify(tRef.current('toast.storageFailed'), 'warn')
+    }
+    window.addEventListener('jj-storage-error', onStorageError)
+    return () => window.removeEventListener('jj-storage-error', onStorageError)
+  }, [notify])
 
   // 只读 progressMap：播放中的实时位置由 Theater 自己显示，
   // 列表不需要跟着每 5s 的 playback.current 重算（否则整页卡片陪跑重渲染）。
@@ -941,32 +1020,37 @@ export default function App() {
     ) => {
       if (!(duration > 0) || !Number.isFinite(duration)) return
       const finished = isProgressFinished(current, duration)
-      setProgressMap((previous) => {
-        const saved = previous[titleId]
-        if (
+      const entry: PlaybackProgress = {
+        current,
+        duration,
+        episodeId,
+        episodeIndex,
+        updatedAt: Date.now(),
+        finished,
+      }
+      const same = (saved: PlaybackProgress | undefined) =>
+        Boolean(
           saved &&
-          saved.episodeId === episodeId &&
-          saved.episodeIndex === episodeIndex &&
-          saved.duration === duration &&
-          Boolean(saved.finished) === finished &&
-          Math.abs(saved.current - current) < 1
-        ) {
-          return previous
-        }
-        return {
-          ...previous,
-          [titleId]: {
-            current,
-            duration,
-            episodeId,
-            episodeIndex,
-            updatedAt: Date.now(),
-            finished,
-          },
-        }
+            saved.episodeId === episodeId &&
+            saved.episodeIndex === episodeIndex &&
+            saved.duration === duration &&
+            Boolean(saved.finished) === finished &&
+            Math.abs(saved.current - current) < 1,
+        )
+      setProgressMap((previous) => {
+        if (same(previous[titleId])) return previous
+        return { ...previous, [titleId]: entry }
       })
+      // 剧集按 titleId → episodeId 单独保存：切回上一集时不会被当前集进度覆盖。
+      if (episodeId) {
+        setEpisodeProgress((previous) => {
+          const episodes = previous[titleId] ?? {}
+          if (same(episodes[episodeId])) return previous
+          return { ...previous, [titleId]: { ...episodes, [episodeId]: entry } }
+        })
+      }
     },
-    [setProgressMap],
+    [setEpisodeProgress, setProgressMap],
   )
 
   // 播放中最近一次进度快照 + 落库节流时间戳。
@@ -1051,6 +1135,7 @@ export default function App() {
   }, [playback, closePlayback, detailId, drawerOpen, query])
 
   const playReqRef = useRef(0)
+  const lastStartRef = useRef<{ key: string; at: number }>({ key: '', at: 0 })
   const playbackRef = useRef<PlaybackState | null>(null)
   // 播放器实时位置（Theater 每秒上报一次）：自动换源定位用，避免逐秒 setState。
   const liveTimeRef = useRef<{ current: number; duration: number } | null>(null)
@@ -1109,6 +1194,19 @@ export default function App() {
           finished: isProgressFinished(live.current, live.duration),
         }
         localStorage.setItem('jj-progress', JSON.stringify(progress))
+        if (session.episodeId) {
+          const rawEpisodes: unknown = JSON.parse(
+            localStorage.getItem('jj-episode-progress') ?? '{}',
+          )
+          const episodes =
+            rawEpisodes && typeof rawEpisodes === 'object' && !Array.isArray(rawEpisodes)
+              ? (rawEpisodes as Record<string, Record<string, PlaybackProgress>>)
+              : {}
+          const perTitle = episodes[session.titleId] ?? {}
+          perTitle[session.episodeId] = progress[session.titleId] as PlaybackProgress
+          episodes[session.titleId] = perTitle
+          localStorage.setItem('jj-episode-progress', JSON.stringify(episodes))
+        }
       } catch {
         // best-effort only
       }
@@ -1425,7 +1523,7 @@ export default function App() {
           }
           const match = readMatch(activeTitle.id)
           const validMatch =
-            match && matchTitleName(activeTitle, match.matchedName) ? match : null
+            match && matchFitsTitle(activeTitle, match) ? match : null
           const probe =
             request.lineIndex === undefined && request.excludeSourceKey === undefined && validMatch
               ? probesRef.current[probeKeyFor(validMatch.sourceKey, validMatch.vodId)]
@@ -1502,7 +1600,14 @@ export default function App() {
             notify(t('toast.episodeClamped'), 'warn')
           }
           if (resolved.sourceErrors.length > 0) {
-            notify(t('toast.sourcePartial', { count: resolved.sourceErrors.length }), 'warn')
+            // play_search 对“慢源转后台”也会返回 error；起播成功后不应再弹警告，
+            // 只有真正失败的源才提示，避免每次播放都被噪声打断。
+            const serious = resolved.sourceErrors.filter(
+              (sourceError) => !/超过搜索时限|后台继续/.test(sourceError.message),
+            )
+            if (serious.length > 0) {
+              notify(t('toast.sourcePartial', { count: serious.length }), 'warn')
+            }
           }
           const recover = autoRecoverRef.current
           if (recover.titleId === title.id && recover.currentSource !== resolved.target.sourceKey) {
@@ -1635,6 +1740,14 @@ export default function App() {
     (id: string, episode?: Episode) => {
       const title = resolveTitle(id)
       if (!title) return
+      // 搜索结果里的源条目只在真正打开/播放时进入 registry，避免目录污染标题缓存。
+      const transient = transientTitlesRef.current.get(id)
+      if (transient) register([transient])
+      // 双击卡片/播放按钮不应发起两套解析；同一作品同一集 600ms 内只受理一次。
+      const startKey = `${id}|${episode?.id ?? ''}`
+      const now = Date.now()
+      if (lastStartRef.current.key === startKey && now - lastStartRef.current.at < 600) return
+      lastStartRef.current = { key: startKey, at: now }
 
       const saved = progressMapRef.current[id]
       const finished = saved?.finished === true
@@ -1649,7 +1762,33 @@ export default function App() {
           : savedNumber !== undefined
             ? Math.max(0, savedNumber - 1)
             : saved?.episodeIndex
-      const startAt = !episode && !finished ? (saved?.current ?? 0) : 0
+      // 用户显式点选某一集时优先用该集的独立进度；否则沿用标题级“当前集”进度。
+      const perEpisode = episodeId
+        ? episodeProgressRef.current[id]?.[episodeId]
+        : undefined
+      const titleCandidate =
+        saved &&
+        (saved.episodeId === episodeId ||
+          (saved.episodeId === undefined &&
+            episode?.number !== undefined &&
+            saved.episodeIndex === episode.number - 1))
+          ? saved
+          : undefined
+      const explicitSaved =
+        episode !== undefined
+          ? [perEpisode, titleCandidate]
+              .filter((entry): entry is PlaybackProgress => Boolean(entry))
+              .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))[0]
+          : undefined
+      const explicitFinished = explicitSaved?.finished === true
+      const startAt =
+        episode !== undefined
+          ? explicitFinished
+            ? 0
+            : (explicitSaved?.current ?? 0)
+          : finished
+            ? 0
+            : (saved?.current ?? 0)
 
       resetAutoRecover(title.id)
       reSearchRef.current = { titleId: title.id, done: false }
@@ -1665,9 +1804,12 @@ export default function App() {
       setDetailId(null)
       setDrawerOpen(false)
       // 静默从上次位置开始会让人以为"怎么从中间播"；超过 30s 才提示，避免噪声。
-      if (!finished && startAt > 30) notify(t('toast.resumed', { time: formatTime(startAt) }), 'info')
+      const canResume = episode !== undefined ? !explicitFinished : !finished
+      if (canResume && startAt > 30) {
+        notify(t('toast.resumed', { time: formatTime(startAt) }), 'info')
+      }
     },
-    [beginPlayback, notify, resetAutoRecover, resolveTitle, t],
+    [beginPlayback, notify, register, resetAutoRecover, resolveTitle, t],
   )
 
   const handlePlaybackLiveTime = useCallback(
@@ -1754,6 +1896,24 @@ export default function App() {
     (status: PlaybackStatus) => {
       // 暂停/结束是天然落库点：此刻用户很可能离开，不该等 60s 节流。
       if (status === 'paused' || status === 'ended') flushLiveProgress(true)
+      // paused/ready/ended 说明启动阶段已经结束（ready 可能是自动播放被拦截，
+      // 视频在等用户点击）。继续跑启动看门狗会在 10s 后误换源。
+      if (status === 'paused' || status === 'ended' || status === 'ready') {
+        clearStartupTimers()
+        startupRef.current.done = true
+        setPlayback((current) =>
+          current
+            ? {
+                ...current,
+                slowStartup: false,
+                autoRecovering: false,
+                status,
+                playing: status === 'paused' || status === 'ended' ? false : current.playing,
+              }
+            : current,
+        )
+        return
+      }
       setPlayback((current) => {
         if (!current || current.status === status) return current
         return {
@@ -1763,7 +1923,7 @@ export default function App() {
         }
       })
     },
-    [flushLiveProgress],
+    [clearStartupTimers, flushLiveProgress],
   )
 
   const handleMediaError = useCallback(
@@ -1772,21 +1932,8 @@ export default function App() {
       clearStartupTimers()
       startupRef.current.done = true
       if (!session) return
-      if (error.code === 'unsupported') {
-        setPlayback((current) =>
-          current
-            ? {
-                ...current,
-                status: 'error',
-                error,
-                playing: false,
-                slowStartup: false,
-                autoRecovering: false,
-              }
-            : current,
-        )
-        return
-      }
+      // unsupported 也先尝试同源其他线路/其他源，不要立刻把用户钉在错误遮罩上。
+      // 只有自动恢复耗尽后，resolve 层才会给出最终 unsupported/no-source。
       if (autoRecoverRef.current.titleId !== session.titleId) {
         resetAutoRecover(session.titleId)
       }
@@ -1852,6 +1999,13 @@ export default function App() {
     if (!current) return
     const title = resolveTitle(current.titleId)
     if (!title) return
+    // 实时位置只存在 liveTimeRef；自动换源失败后 liveTimeRef 可能已被失败尝试写成 0，
+// 此时应优先保留 autoRecover 记录的故障位置。重试前必须快照，否则会回到起点。
+    const recover = autoRecoverRef.current
+    const resumeAt =
+      recover.titleId === current.titleId && recover.resumePosition !== undefined
+        ? recover.resumePosition
+        : liveCurrent()
     resetAutoRecover(current.titleId)
     if (current.target) {
       const requestId = playReqRef.current + 1
@@ -1861,6 +2015,7 @@ export default function App() {
         state
           ? {
               ...state,
+              current: resumeAt,
               error: undefined,
               status: 'loading',
               slowStartup: false,
@@ -1875,7 +2030,7 @@ export default function App() {
       episodeId: current.episodeId,
       episodeNumber: current.episodeNumber,
       episodeIndex: current.episodeIndex,
-      startAt: liveCurrent(),
+      startAt: resumeAt,
       detail: current.detail,
     })
   }, [beginPlayback, liveCurrent, resetAutoRecover, resolveTitle])
@@ -1936,14 +2091,19 @@ export default function App() {
       if (!title) return
       const line = current.detail.lines[current.lineIndex ?? 0]
       if (!line || !isPlayableEpisode(line.episodes[index])) return
+      const episodeId =
+        title.mediaType === 'series' ? episodeIdForIndex(title, index) : undefined
+      const titleSaved = progressMapRef.current[title.id]
+      const saved =
+        (episodeId ? episodeProgressRef.current[title.id]?.[episodeId] : undefined) ??
+        (titleSaved?.episodeId === episodeId ? titleSaved : undefined)
       resetAutoRecover(current.titleId)
       beginPlayback(title, {
-        episodeId:
-          title.mediaType === 'series' ? episodeIdForIndex(title, index) : undefined,
+        episodeId,
         episodeNumber: title.mediaType === 'series' ? index + 1 : undefined,
         episodeIndex: index,
         lineIndex: current.lineIndex,
-        startAt: 0,
+        startAt: saved && !saved.finished ? saved.current : 0,
         detail: current.detail,
         stayOnSource: true,
       })
@@ -2241,6 +2401,8 @@ export default function App() {
 
   const toggleList = useCallback(
     (id: string) => {
+      const transient = transientTitlesRef.current.get(id)
+      if (transient) register([transient])
       const added = !myList.includes(id)
       const name = nameOf(id)
       setMyList(added ? [id, ...myList] : myList.filter((item) => item !== id))
@@ -2250,11 +2412,13 @@ export default function App() {
           : t('toast.removedFromList', { name }),
       )
     },
-    [myList, nameOf, notify, setMyList, t],
+    [myList, nameOf, notify, register, setMyList, t],
   )
 
   const toggleLater = useCallback(
     (id: string) => {
+      const transient = transientTitlesRef.current.get(id)
+      if (transient) register([transient])
       const added = !later.includes(id)
       const name = nameOf(id)
       setLater(added ? [id, ...later] : later.filter((item) => item !== id))
@@ -2264,22 +2428,49 @@ export default function App() {
           : t('toast.removedFromLater', { name }),
       )
     },
-    [later, nameOf, notify, setLater, t],
+    [later, nameOf, notify, register, setLater, t],
   )
 
   const toggleLike = useCallback(
     (id: string) => {
+      const transient = transientTitlesRef.current.get(id)
+      if (transient) register([transient])
       const added = !liked.includes(id)
       const name = nameOf(id)
       setLiked(added ? [id, ...liked] : liked.filter((item) => item !== id))
       notify(added ? t('toast.liked', { name }) : t('toast.ratingRemoved'))
     },
-    [liked, nameOf, notify, setLiked, t],
+    [liked, nameOf, notify, register, setLiked, t],
   )
 
-  const openDetail = useCallback((id: string) => {
-    setDetailId(id)
-  }, [])
+  const toggleSource = useCallback(
+    async (key: string) => {
+      const source = sourceInfos.find((entry) => entry.key === key)
+      if (!source) return
+      try {
+        const list = await setPlaySourceEnabled(key, !source.enabled)
+        setSourceInfos(list)
+        notify(
+          t(source.enabled ? 'toast.sourceDisabled' : 'toast.sourceEnabled', {
+            name: source.name,
+          }),
+          'info',
+        )
+      } catch {
+        notify(t('toast.sourceToggleFailed'), 'warn')
+      }
+    },
+    [notify, sourceInfos, t],
+  )
+
+  const openDetail = useCallback(
+    (id: string) => {
+      const transient = transientTitlesRef.current.get(id)
+      if (transient) register([transient])
+      setDetailId(id)
+    },
+    [register],
+  )
 
   const detailTitle = detailId ? resolveTitle(detailId) : null
   const playingTitle = playback ? resolveTitle(playback.titleId) : null
@@ -2303,7 +2494,7 @@ export default function App() {
       let vodId = ''
       const match = readMatch(title.id)
       const validMatch =
-        match && matchTitleName(title, match.matchedName) ? match : null
+        match && matchFitsTitle(title, match) ? match : null
       // 详情页只对“已经有匹配结果”的标题做后台探测；
       // 没有匹配时不在这里跑全源搜索，避免打开详情 3 秒就触发一次解析风暴。
       if (!validMatch) {
@@ -2336,11 +2527,11 @@ export default function App() {
   useEffect(() => {
     if (!detailTitle) return
     // Debounced background prefetch: search/detail/target + probe, never blocking the modal.
-    // 3s:短暂路过详情页不值得付出全源搜索的流量。
+    // 6s:短暂路过详情页不值得付出全源搜索与分片探测的流量。
     const title = detailTitle
     const timer = window.setTimeout(() => {
       void ensureProbe(title)
-    }, 3000)
+    }, 6000)
     return () => window.clearTimeout(timer)
   }, [detailTitle, ensureProbe])
 
@@ -2470,20 +2661,24 @@ export default function App() {
                   results={searchResults}
                   busy={searchBusy}
                   partialErrors={searchSourceErrors}
+                  error={searchError}
                   myList={myList}
                   progressFor={progressFor}
                   onOpen={openDetail}
                   onPlay={startWatch}
                   onToggleList={toggleList}
                   onClear={() => updateQuery('')}
+                  onRetry={() => setSearchNonce((value) => value + 1)}
                 />
               ) : view === 'home' ? (
                 <HomeView
                   slideIndex={slideIndex}
                   slides={heroSlides}
                   items={homeItems}
+                  continueItems={recentItems.slice(0, 6)}
                   feed={feeds.home ?? emptyFeed}
                   myList={myList}
+                  progressFor={progressFor}
                   resolveTitle={resolveTitle}
                   onSlide={setSlideIndex}
                   onNavigate={handleNavigate}
@@ -2500,6 +2695,10 @@ export default function App() {
                   resolveTitle={resolveTitle}
                   recentItems={recentItems}
                   sources={sourceInfos}
+                  sourcesLoaded={sourcesLoaded}
+                  sourcesFailed={sourcesFailed}
+                  onReloadSources={() => void loadSources()}
+                  onToggleSource={toggleSource}
                   feedExhausted={Boolean(feedExhaustedMap[view])}
                   autoplayNext={autoplayNext}
                   onToggleAutoplay={() => setAutoplayNext((value) => !value)}

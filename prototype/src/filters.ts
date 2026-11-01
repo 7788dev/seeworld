@@ -266,13 +266,27 @@ export const sanitizeFilters = (
 ): ExploreValues => {
   if (!values) return config.defaults
   const allowedForms = config.forms?.map((form) => form.value)
+  const form =
+    !allowedForms || allowedForms.includes(values.form)
+      ? values.form
+      : config.defaults.form
+  const pick = (value: unknown, options: string[], fallback: string) =>
+    typeof value === 'string' && options.includes(value) ? value : fallback
+  const rawRating = (values as { minRating?: unknown }).minRating
+  const minRating =
+    typeof rawRating === 'number' && Number.isFinite(rawRating)
+      ? Math.min(10, Math.max(0, Math.round(rawRating)))
+      : config.defaults.minRating
+  const sort = config.sorts.some((option) => option.value === values.sort)
+    ? values.sort
+    : config.defaults.sort
   return {
-    ...config.defaults,
-    ...values,
-    form:
-      !allowedForms || allowedForms.includes(values.form)
-        ? values.form
-        : config.defaults.form,
+    form,
+    genre: pick(values.genre, config.genres, ''),
+    region: pick(values.region, config.regions, ''),
+    year: pick(values.year, config.years, ''),
+    minRating,
+    sort,
   }
 }
 

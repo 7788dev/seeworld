@@ -187,6 +187,29 @@ describe('filters', () => {
     expect(filterLabel('90年代', 'en')).toBe("'90s")
     expect(filterLabel('喜剧', 'zh')).toBe('喜剧')
   })
+
+  it('sanitizeFilters 校验全部字段，而不只是 form', () => {
+    const config = {
+      genres: ['喜剧'],
+      regions: ['美国'],
+      years: ['2024'],
+      sorts: [{ value: 'T' as const, labelKey: 'filter.sortRecommend' as const }],
+      defaults: { form: 'all', genre: '', region: '', year: '', minRating: 0, sort: 'T' as const },
+    }
+    const sanitized = sanitizeFilters(config, {
+      form: 'all',
+      genre: 123 as unknown as string,
+      region: '不存在',
+      year: '2024',
+      minRating: 99,
+      sort: 'X' as unknown as 'T',
+    })
+    expect(sanitized.genre).toBe('')
+    expect(sanitized.region).toBe('')
+    expect(sanitized.year).toBe('2024')
+    expect(sanitized.minRating).toBe(10)
+    expect(sanitized.sort).toBe('T')
+  })
 })
 
 describe('languages', () => {

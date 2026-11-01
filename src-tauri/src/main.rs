@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod backup;
 mod douban;
 mod play;
 mod play_proxy;
@@ -30,11 +31,13 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            backup::export_backup,
             douban::douban_list,
             douban::douban_suggest,
             douban::douban_detail,
             douban::douban_recommend,
             play::play_sources,
+            play::play_set_source_enabled,
             play::play_probe,
             play::play_search,
             play::play_detail,

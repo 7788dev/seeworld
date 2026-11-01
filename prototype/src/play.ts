@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { Title } from './data'
+import type { MediaType, Title } from './data'
 import { isDesktopApp } from './lib'
 
 export type PlayFormat = 'hls' | 'mp4' | 'unknown'
@@ -36,6 +36,7 @@ export interface PlaySearchItem {
 export interface PlaySearchResponse {
   items: PlaySearchItem[]
   errors: PlaySourceError[]
+  sourceCount: number
 }
 
 export interface PlayEpisode {
@@ -165,14 +166,42 @@ const invokePlay = async <T,>(command: string, args: Record<string, unknown>): P
 
 export const playSources = () => invokePlay<PlaySourceInfo[]>('play_sources', {})
 
+export const setPlaySourceEnabled = (key: string, enabled: boolean) =>
+  invokePlay<PlaySourceInfo[]>('play_set_source_enabled', { key, enabled })
+
+// 同一 webview 内的单飞：搜索页、详情、播放解析/线路聚合可能同时请求同一个资源。
+const searchFlights = new Map<string, Promise<PlaySearchResponse>>()
+const detailFlights = new Map<string, Promise<PlayDetail>>()
+const probeFlights = new Map<string, Promise<PlayProbeResult>>()
+
+const singleFlight = <T,>(
+  flights: Map<string, Promise<T>>,
+  key: string,
+  run: () => Promise<T>,
+): Promise<T> => {
+  const existing = flights.get(key)
+  if (existing) return existing
+  const promise = run().finally(() => {
+    flights.delete(key)
+  })
+  flights.set(key, promise)
+  return promise
+}
+
 export const playSearch = (query: string, sourceKey?: string) =>
-  invokePlay<PlaySearchResponse>('play_search', sourceKey ? { query, sourceKey } : { query })
+  singleFlight(searchFlights, `${sourceKey ?? '*'}|${query}`, () =>
+    invokePlay<PlaySearchResponse>('play_search', sourceKey ? { query, sourceKey } : { query }),
+  )
 
 export const playDetail = (sourceKey: string, vodId: string) =>
-  invokePlay<PlayDetail>('play_detail', { sourceKey, vodId })
+  singleFlight(detailFlights, `${sourceKey}|${vodId}`, () =>
+    invokePlay<PlayDetail>('play_detail', { sourceKey, vodId }),
+  )
 
 export const playProbe = (sourceKey: string, vodId: string) =>
-  invokePlay<PlayProbeResult>('play_probe', { sourceKey, vodId })
+  singleFlight(probeFlights, `${sourceKey}|${vodId}`, () =>
+    invokePlay<PlayProbeResult>('play_probe', { sourceKey, vodId }),
+  )
 
 export const playResolve = async (
   sourceKey: string,
@@ -199,6 +228,8 @@ export interface PlayMatch {
   vodId: string
   lineIndex: number
   matchedName: string
+  year?: number
+  mediaType?: MediaType
   updatedAt: number
 }
 
@@ -240,6 +271,11 @@ const isPlayMatch = (value: unknown): value is PlayMatch => {
     typeof match.vodId === 'string' &&
     match.vodId.length > 0 &&
     typeof match.matchedName === 'string' &&
+    (match.year === undefined ||
+      (typeof match.year === 'number' && Number.isFinite(match.year))) &&
+    (match.mediaType === undefined ||
+      match.mediaType === 'series' ||
+      match.mediaType === 'film') &&
     typeof match.updatedAt === 'number' &&
     Number.isFinite(match.updatedAt)
   )
@@ -294,6 +330,20 @@ export const readMatch = (titleId: string): PlayMatch | null => {
   return match
 }
 
+/** match 缓存不仅要名称对得上，年份/媒体类型也不能冲突。 */
+export function matchFitsTitle(title: Title, match: PlayMatch): boolean {
+  if (!matchTitleName(title, match.matchedName)) return false
+  if (
+    match.year !== undefined &&
+    title.year > 0 &&
+    match.year > 0 &&
+    Math.abs(title.year - match.year) > 2
+  ) {
+    return false
+  }
+  return match.mediaType === undefined || match.mediaType === title.mediaType
+}
+
 export const writeMatch = (titleId: string, match: Omit<PlayMatch, 'updatedAt'>) => {
   const matches: Record<string, PlayMatch> = {
     ...readMatches(),
@@ -337,10 +387,29 @@ const SEASON_EPISODE_MARKERS =
   /(?:第[一二三四五六七八九十百0-9]+[季部集期]|season\s*\d+|s\d{1,2}(?:e\d{1,3})?|episode\s*\d+)/i
 const SPINOFF_MARKERS = /(?:外传|前传|后传|番外|剧场版|特别篇|衍生|之|篇)/
 const SERIES_TYPE_MARKERS =
-  /(?:电视剧|连续剧|短剧|网剧|美剧|韩剧|日剧|泰剧|港剧|台剧|国产剧|欧美剧|日韩剧|海外剧|剧集|动漫|动画|番剧|综艺|纪录片|记录片)/
+  /(?:电视剧|连续剧|短剧|网剧|美剧|韩剧|日剧|泰剧|港剧|台剧|国产剧|欧美剧|日韩剧|海外剧|剧集|动漫|番剧|综艺|动画(?!片|电影))/
 
 export const sourceTypeIsSeries = (typeName?: string) =>
   Boolean(typeName && SERIES_TYPE_MARKERS.test(typeName))
+
+/** 解说/预告/花絮/混剪等二创不是正片，搜索结果里也不应展示。 */
+export const isVariantSearchResult = (name?: string) =>
+  Boolean(name && VARIANT_MARKERS.test(name))
+
+const FILM_ONLY_MARKERS = /(?:电影|影片|剧场版)/
+// 动漫/动画本身可能是剧场版，不能作为“明确是剧集”的依据。
+const CLEAR_SERIES_MARKERS =
+  /(?:电视剧|连续剧|短剧|网剧|美剧|韩剧|日剧|泰剧|港剧|台剧|国产剧|欧美剧|日韩剧|海外剧|剧集|番剧|综艺)/
+
+/** 类型名与 Title 的媒体类型是否明确冲突。未知/模糊类型不判冲突，避免误杀。 */
+export const sourceTypeConflictsWithTitle = (
+  mediaType: Title['mediaType'],
+  typeName?: string,
+) => {
+  if (!typeName?.trim()) return false
+  if (mediaType === 'film') return CLEAR_SERIES_MARKERS.test(typeName)
+  return FILM_ONLY_MARKERS.test(typeName)
+}
 
 const stripDecorations = (raw: string) =>
   raw
@@ -352,6 +421,48 @@ const normalizeName = (raw: string) =>
     .normalize('NFKC')
     .toLowerCase()
     .replace(/[\s·•・:：!！?？'"“”‘’.,，。、~～\-—_()（）[\]【】]/g, '')
+
+/**
+ * 搜索框的相关性判断。
+ *
+ * CMS 搜索并不都支持 wd：lzi/bfzy 会忽略关键词返回整站目录。
+ * 搜索结果页必须自己过滤，否则用户会看到大量无关影片；
+ * 播放解析另有 rankCandidates，两者不能用不同的相关性标准。
+ */
+export const matchesSearchQuery = (query: string, candidateName?: string) => {
+  if (!candidateName) return false
+  const needle = normalizeName(query)
+  const candidate = normalizeName(candidateName)
+  if (!needle || !candidate) return false
+  if (needle === candidate) return true
+  if (needle.length < 2 || candidate.length < 2) return false
+  return candidate.includes(needle)
+}
+
+/** 搜索结果的“作品版本”键：同名不同年份/类型必须保留为不同条目。 */
+export const searchVersionKey = (title: Title) =>
+  `${normalizeName(title.name)}|${title.year > 0 ? title.year : 0}|${title.mediaType}`
+
+/**
+ * 合并豆瓣联想与源站搜索结果。
+ * 豆瓣条目按 id 保留所有版本；源条目按作品版本去重，避免同一部片被多个源刷屏。
+ */
+export function mergeSearchResults(doubanTitles: Title[], sourceTitles: Title[]): Title[] {
+  const byKey = new Map<string, Title>()
+  const versions = new Set<string>()
+  for (const title of doubanTitles) {
+    byKey.set(title.id, title)
+    versions.add(searchVersionKey(title))
+  }
+  for (const title of sourceTitles) {
+    if (byKey.has(title.id)) continue
+    const version = searchVersionKey(title)
+    if (versions.has(version)) continue
+    versions.add(version)
+    byKey.set(title.id, title)
+  }
+  return [...byKey.values()]
+}
 
 const containmentExtra = (name: string, candidate: string) => {
   if (name === candidate) return ''
@@ -414,9 +525,23 @@ export function rankCandidates(title: Title, items: PlaySearchItem[]): PlaySearc
     if (!exact && (!yearKnown || !matchTitleName(title, item.name))) {
       return { item, score: Number.NEGATIVE_INFINITY, nameScore: 0 }
     }
+    const itemYear = Number.parseInt(item.year, 10)
+    // 同名不同年份的翻拍不能只降权：如果源站只有另一版，降权仍会选中它。
+    // 双方年份都已知且差距 >2 年时直接拒绝；年份缺失时保留原逻辑。
+    if (
+      year > 0 &&
+      Number.isFinite(itemYear) &&
+      itemYear > 0 &&
+      Math.abs(itemYear - year) > 2
+    ) {
+      return { item, score: Number.NEGATIVE_INFINITY, nameScore: 0 }
+    }
+    // 电影 vs 剧集是明确的内容错配，不能靠 +10 分来“优选”。
+    if (sourceTypeConflictsWithTitle(title.mediaType, item.typeName)) {
+      return { item, score: Number.NEGATIVE_INFINITY, nameScore: 0 }
+    }
     const nameScore = exact ? 100 : 60
     let score = nameScore
-    const itemYear = Number.parseInt(item.year, 10)
     if (year > 0 && Number.isFinite(itemYear)) {
       const gap = Math.abs(itemYear - year)
       if (gap === 0) score += 30
@@ -431,6 +556,26 @@ export function rankCandidates(title: Title, items: PlaySearchItem[]): PlaySearc
     .filter((entry) => Number.isFinite(entry.score) && entry.nameScore > 0)
     .sort((left, right) => right.score - left.score)
     .map((entry) => entry.item)
+}
+
+/**
+ * 源详情是否确实属于当前 Title。
+ *
+ * 搜索阶段的名称匹配只验证了候选条目；详情接口可能忽略 ids 返回另一条内容，
+ * 或者返回同名翻拍/不同季。这里在真正 resolve 前再校验一次名称、年份和类型。
+ */
+export const detailMatchesTitle = (title: Title, detail: PlayDetail) => {
+  if (!matchTitleName(title, detail.name)) return false
+  const detailYear = Number.parseInt(detail.year, 10)
+  if (
+    title.year > 0 &&
+    Number.isFinite(detailYear) &&
+    detailYear > 0 &&
+    Math.abs(title.year - detailYear) > 2
+  ) {
+    return false
+  }
+  return !sourceTypeConflictsWithTitle(title.mediaType, detail.typeName)
 }
 
 export const isPlayableLine = (line: PlayLine) =>
@@ -695,7 +840,7 @@ export async function resolveSession(
   if (options.excludeSourceKey) excluded.add(options.excludeSourceKey)
   const encodedSource = sourceFromTitleId(title.id)
   const storedMatch = readMatch(title.id)
-  if (storedMatch && !matchTitleName(title, storedMatch.matchedName)) {
+  if (storedMatch && !matchFitsTitle(title, storedMatch)) {
     console.info(
       '[jj] stale play match dropped',
       title.name,
@@ -705,8 +850,7 @@ export async function resolveSession(
     clearMatch(title.id)
   }
   // ps- 条目的 id 自带来源信息，不依赖搜索阶段写入 match 缓存。
-  const validStoredMatch =
-    storedMatch && matchTitleName(title, storedMatch.matchedName) ? storedMatch : null
+  const validStoredMatch = storedMatch && matchFitsTitle(title, storedMatch) ? storedMatch : null
   const cache: PlayMatch | null =
     validStoredMatch ??
     (encodedSource
@@ -714,6 +858,8 @@ export async function resolveSession(
           ...encodedSource,
           lineIndex: 0,
           matchedName: title.name,
+          year: title.year > 0 ? title.year : undefined,
+          mediaType: title.mediaType,
           updatedAt: Date.now(),
         }
       : null)
@@ -740,27 +886,38 @@ export async function resolveSession(
     (!options.preferredSourceKey || options.detail.sourceKey === options.preferredSourceKey) &&
     options.detail.lines?.some((line) => isPlayableLine(line))
   ) {
-    try {
-      const resolved = await resolveFromDetail(options.detail, {
-        ...options,
-        stepTimeoutMs: timeoutFor(),
-      })
-      writeMatch(title.id, {
-        sourceKey: options.detail.sourceKey,
-        vodId: options.detail.vodId,
-        lineIndex: resolved.lineIndex,
-        matchedName: options.detail.name,
-      })
-      return { detail: options.detail, ...resolved, sourceErrors: [] }
-    } catch (error) {
-      failures.push(`${options.detail.sourceKey}: ${messageOf(error)}`)
+    if (!detailMatchesTitle(title, options.detail)) {
+      const error = new PlayRequestError(
+        'no-source',
+        `源详情与片名/年份/类型不匹配：${options.detail.name}`,
+      )
+      failures.push(`${options.detail.sourceKey}: ${error.message}`)
       options.onSourceFailure?.(options.detail.sourceKey, error)
+    } else {
+      try {
+        const resolved = await resolveFromDetail(options.detail, {
+          ...options,
+          stepTimeoutMs: timeoutFor(),
+        })
+        writeMatch(title.id, {
+          sourceKey: options.detail.sourceKey,
+          vodId: options.detail.vodId,
+          lineIndex: resolved.lineIndex,
+          matchedName: options.detail.name,
+          year: Number.parseInt(options.detail.year, 10) || undefined,
+          mediaType: title.mediaType,
+        })
+        return { detail: options.detail, ...resolved, sourceErrors: [] }
+      } catch (error) {
+        failures.push(`${options.detail.sourceKey}: ${messageOf(error)}`)
+        options.onSourceFailure?.(options.detail.sourceKey, error)
+      }
     }
   }
 
   const cacheUsable =
     cache &&
-    matchTitleName(title, cache.matchedName) &&
+    matchFitsTitle(title, cache) &&
     // 用户显式指定源(线路面板跨源切换)时,不得被旧 match 缓存抢走。
     (!options.preferredSourceKey || cache.sourceKey === options.preferredSourceKey)
   if (checkBudget() && cacheUsable && cache && !excluded.has(cache.sourceKey)) {
@@ -770,7 +927,15 @@ export async function resolveSession(
         timeoutFor(),
         `加载已匹配源「${cache.sourceKey}」超时`,
       )
-      if (detail.lines?.some((line) => isPlayableLine(line))) {
+      if (!detailMatchesTitle(title, detail)) {
+        const error = new PlayRequestError(
+          'no-source',
+          `源详情与片名/年份/类型不匹配：${detail.name}`,
+        )
+        failures.push(`${cache.sourceKey}: ${error.message}`)
+        clearMatch(title.id)
+        options.onSourceFailure?.(cache.sourceKey, error)
+      } else if (detail.lines?.some((line) => isPlayableLine(line))) {
         const resolved = await resolveFromDetail(detail, {
           ...options,
           stepTimeoutMs: timeoutFor(),
@@ -780,6 +945,8 @@ export async function resolveSession(
           vodId: detail.vodId,
           lineIndex: resolved.lineIndex,
           matchedName: detail.name,
+          year: Number.parseInt(detail.year, 10) || undefined,
+          mediaType: title.mediaType,
         })
         return { detail, ...resolved, sourceErrors: [] }
       }
@@ -858,6 +1025,15 @@ export async function resolveSession(
         timeoutFor(),
         `加载「${candidate.sourceKey}」详情超时`,
       )
+      if (!detailMatchesTitle(title, detail)) {
+        const mismatch = new PlayRequestError(
+          'no-source',
+          `源详情与片名/年份/类型不匹配：${detail.name}`,
+        )
+        failures.push(`${candidate.sourceKey}: ${mismatch.message}`)
+        options.onSourceFailure?.(candidate.sourceKey, mismatch)
+        continue
+      }
       if (!detail.lines?.some((line) => isPlayableLine(line))) {
         failures.push(`${candidate.sourceKey}: 没有可用的 HLS/MP4 线路`)
         sawUnsupported = true
@@ -872,7 +1048,9 @@ export async function resolveSession(
         sourceKey: detail.sourceKey,
         vodId: detail.vodId,
         lineIndex: resolved.lineIndex,
-        matchedName: candidate.name,
+        matchedName: detail.name,
+        year: Number.parseInt(detail.year, 10) || undefined,
+        mediaType: title.mediaType,
       })
       return { detail, ...resolved, sourceErrors }
     } catch (error) {

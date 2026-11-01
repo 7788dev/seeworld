@@ -44,7 +44,12 @@ export function usePersistentState<T>(
       try {
         localStorage.setItem(key, JSON.stringify(next))
       } catch {
-        // storage can be unavailable in private browsing
+        // storage can be unavailable in private browsing / quota can be exceeded
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('jj-storage-error', { detail: { key } }),
+          )
+        }
       }
     },
     [key],

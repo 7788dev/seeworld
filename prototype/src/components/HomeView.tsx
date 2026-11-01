@@ -1,6 +1,7 @@
 import { ChevronRight, Loader2, RefreshCw } from 'lucide-react'
 import type { Slide, Title, ViewKey } from '../data'
 import type { FeedState } from '../douban'
+import type { PlaybackProgress } from '../types'
 import { useI18n } from '../i18n'
 import Hero from './Hero'
 import PosterSkeleton from './PosterSkeleton'
@@ -10,8 +11,10 @@ interface HomeViewProps {
   slideIndex: number
   slides: Slide[]
   items: Title[]
+  continueItems: Title[]
   feed: FeedState
   myList: string[]
+  progressFor: (id: string) => PlaybackProgress | undefined
   resolveTitle: (id: string) => Title | undefined
   onSlide: (index: number) => void
   onNavigate: (view: ViewKey) => void
@@ -25,8 +28,10 @@ export default function HomeView({
   slideIndex,
   slides,
   items,
+  continueItems,
   feed,
   myList,
+  progressFor,
   resolveTitle,
   onSlide,
   onNavigate,
@@ -123,6 +128,36 @@ export default function HomeView({
           />
         ))}
       </div>
+
+      {continueItems.length > 0 && (
+        <section className="shelf" aria-labelledby="continue-heading">
+          <div className="section-head">
+            <h2 id="continue-heading">{t('top.continueWatching')}</h2>
+            <button
+              type="button"
+              className="section-chevron"
+              aria-label={t('nav.recent')}
+              onClick={() => onNavigate('recent')}
+            >
+              <ChevronRight size={18} strokeWidth={2.1} aria-hidden />
+            </button>
+          </div>
+          <div className="poster-grid poster-grid--home">
+            {continueItems.map((title, index) => (
+              <TitleCard
+                key={title.id}
+                title={title}
+                inList={myList.includes(title.id)}
+                progress={progressFor(title.id)}
+                priority={index < 3}
+                onOpen={onOpen}
+                onPlay={onPlay}
+                onToggleList={onToggleList}
+              />
+            ))}
+          </div>
+        </section>
+      )}
 
       <section className="shelf" aria-labelledby="new-popular-heading">
         <div className="section-head">

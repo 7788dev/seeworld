@@ -28,9 +28,10 @@ import { episodesOf } from '../douban'
 import { useI18n } from '../i18n'
 import { isDesktopApp } from '../lib'
 import {
+  detailMatchesTitle,
   isPlayableEpisode,
   isPlayableLine,
-  matchTitleName,
+  matchFitsTitle,
   playDetail,
   readMatch,
   sourceFromTitleId,
@@ -74,6 +75,7 @@ export default function DetailModal({
   // 真实源站数据:详情打开后用播放源的实际内容增强(每集真实名称、真实简介)。
   // ps- 前缀是搜索结果直接命中的源站条目,按 id 还原 sourceKey/vodId。
   const [sourceEpisodeNames, setSourceEpisodeNames] = useState<string[]>([])
+  const [sourceLoading, setSourceLoading] = useState(false)
   const [sourceOverride, setSourceOverride] = useState<
     Pick<Title, 'synopsis' | 'episodes' | 'episodesCount'> | null
   >(null)
@@ -84,6 +86,7 @@ export default function DetailModal({
   useEffect(() => {
     setSourceOverride(null)
     setSourceEpisodeNames([])
+    setSourceLoading(false)
   }, [titleProp.id])
 
   useEffect(() => {
@@ -94,12 +97,15 @@ export default function DetailModal({
       sourceFromTitleId(id) ??
       (() => {
         const match = readMatch(id)
-        return match && matchTitleName(titleProp, match.matchedName) ? match : null
+        return match && matchFitsTitle(titleProp, match) ? match : null
       })()
     if (!fromSearch) return
+    setSourceLoading(true)
     void playDetail(fromSearch.sourceKey, fromSearch.vodId)
       .then((detail) => {
         if (cancelled) return
+        // 详情接口可能返回另一部片；名称/年份/类型不匹配时不要用它的剧集与简介。
+        if (!detailMatchesTitle(titleProp, detail)) return
         const line = detail.lines.find(isPlayableLine)
         if (!line || line.episodes.length === 0) return
         const playable = line.episodes
@@ -124,6 +130,9 @@ export default function DetailModal({
         })
       })
       .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setSourceLoading(false)
+      })
     return () => {
       cancelled = true
     }
@@ -156,6 +165,7 @@ export default function DetailModal({
           : ''
       : formatRuntimeLabel(title.duration, language)
   const localizedName = titleName(title, language)
+  const languageName = titleLanguageName(title, language)
   const separator = language === 'zh' ? '、' : ', '
   const progressLabel = initialEpisode
     ? formatEpisodeLabel(
@@ -240,7 +250,6 @@ export default function DetailModal({
               {meta && <span>{meta}</span>}
               {title.region && <span>{title.region}</span>}
               {title.ageRating && <span className="age-chip">{title.ageRating}</span>}
-              <span className="quality-chip">HD</span>
             </div>
           </div>
         </div>
@@ -282,10 +291,11 @@ export default function DetailModal({
             >
               <ThumbsUp size={18} fill={liked ? 'currentColor' : 'none'} />
             </button>
-            <span className="detail-audio">
-              <Volume2 size={15} aria-hidden /> {titleLanguageName(title, language)} ·{' '}
-              {t('detail.audioDescription')}
-            </span>
+            {languageName && (
+              <span className="detail-audio">
+                <Volume2 size={15} aria-hidden /> {languageName}
+              </span>
+            )}
           </div>
 
           {progress && progressPct > 0 && (
@@ -293,6 +303,12 @@ export default function DetailModal({
               <span style={{ width: `${progressPct}%` }} />
               <p>{progressLabel}</p>
             </div>
+          )}
+
+          {sourceLoading && (
+            <p className="detail-source-loading" role="status">
+              {t('common.loading')}
+            </p>
           )}
 
           <div className="detail-columns">
@@ -347,12 +363,11 @@ export default function DetailModal({
                   <span>{language === 'zh' ? '上映：' : 'Released:'}</span> {title.pubdate}
                 </p>
               )}
-              <p>
-                <span>{t('detail.audio')}</span>{' '}
-                {t('detail.audioValue', {
-                  language: titleLanguageName(title, language),
-                })}
-              </p>
+              {languageName && (
+                <p>
+                  <span>{t('detail.audio')}</span> {languageName}
+                </p>
+              )}
             </aside>
           </div>
 
@@ -377,7 +392,7 @@ export default function DetailModal({
                       onClick={() => onPlay(title.id, episode)}
                     >
                       <span className="detail-episode-thumb">
-                        <img src={title.poster || undefined} alt="" onError={onImageError} />
+                        <img src={title.poster || undefined} alt="" loading="lazy" decoding="async" onError={onImageError} />
                         <span>
                           <Play size={12} fill="currentColor" strokeWidth={0} />
                         </span>
@@ -413,7 +428,7 @@ export default function DetailModal({
                     className="related-card"
                     onClick={() => onOpenRelated(item.id)}
                   >
-                    <img src={item.poster || undefined} alt="" onError={onImageError} />
+                    <img src={item.poster || undefined} alt="" loading="lazy" decoding="async" onError={onImageError} />
                     <span className="related-shade" aria-hidden />
                     <span className="related-copy">
                       <span className="related-top">

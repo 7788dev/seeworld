@@ -36,6 +36,12 @@ export interface UseHlsPlayerOptions {
   callbacks?: MediaCallbacks
 }
 
+export interface QualityLevel {
+  index: number
+  height: number
+  bitrate: number
+}
+
 export interface HlsPlayerController {
   videoRef: React.RefObject<HTMLVideoElement | null>
   phase: MediaPhase
@@ -43,6 +49,8 @@ export interface HlsPlayerController {
   duration: number
   buffered: number
   quality: string | null
+  levels: QualityLevel[]
+  selectedLevel: number | 'auto'
   error: PlayErrorInfo | null
   usingProxy: boolean
   rate: number
@@ -51,6 +59,7 @@ export interface HlsPlayerController {
   toggle: () => void
   seek: (seconds: number) => void
   setRate: (rate: number) => void
+  setLevel: (level: number | 'auto') => void
   retry: () => void
   retryOnProxy: () => void
 }
@@ -108,6 +117,9 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
   const [duration, setDuration] = useState(0)
   const [buffered, setBuffered] = useState(0)
   const [quality, setQuality] = useState<string | null>(null)
+  const [levels, setLevels] = useState<QualityLevel[]>([])
+  const [selectedLevel, setSelectedLevel] = useState<number | 'auto'>('auto')
+  const topLevelIndexRef = useRef(0)
   const [error, setError] = useState<PlayErrorInfo | null>(null)
   const [usingProxy, setUsingProxy] = useState(false)
   const [attempt, setAttempt] = useState(0)
@@ -149,6 +161,8 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     setDuration(0)
     setBuffered(0)
     setQuality(null)
+    setLevels([])
+    setSelectedLevel('auto')
     setUsingProxy(false)
 
     if (!target) {
@@ -168,8 +182,6 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     let firstFrameSent = false
     let lastAdvanceAt = Date.now()
     let lastTime = 0
-    let stableSince: number | null = null
-    let upgradedToTop = false
     let topLevelIndex = 0
     let bufferEpisodeActive = false
     let bufferCounted = false
@@ -181,6 +193,9 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     let firstFrameAt = 0
     let lastKnownTime = Math.max(0, startTimeRef.current || 0)
     let pendingRestore = lastKnownTime > 0
+    // React 侧时间/缓冲只用于 UI：timeupdate 可达 4Hz，逐次 setState 会让
+    // Theater（含剧集抽屉）整棵重渲染。1Hz 足够进度条与时间显示。
+    let lastUiTimeAt = 0
 
     if (preferProxy) setUsingProxy(true)
     updatePhase('loading')
@@ -290,6 +305,7 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
       if (cancelled) return
       const total = finiteDuration(video)
       setDuration(total)
+      setBuffered(readBuffered(video))
       updateResolution()
       // 换集/换源会重建 media，浏览器把 playbackRate 重置成 1，这里恢复用户选择的倍速。
       try {
@@ -311,28 +327,14 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
         singleStallSignaled = false
         endBufferEpisode()
       }
-      if (
-        !upgradedToTop &&
-        stableSince !== null &&
-        hls &&
-        hls.levels.length > 1 &&
-        Date.now() - stableSince >= 5000
-      ) {
-        try {
-          // Stable for 5s: move to the capped top rendition once, then let ABR downshift.
-          hls.nextLevel = topLevelIndex
-          upgradedToTop = true
-        } catch {
-          // ignore unsupported level switches
-        }
+      const now = Date.now()
+      if (now - lastUiTimeAt >= 1000 || video.ended) {
+        lastUiTimeAt = now
+        // 同一个 1Hz tick 内更新 time + buffered，React 会合并成一次渲染。
+        setTime(video.currentTime)
+        setBuffered(readBuffered(video))
       }
-      setTime(video.currentTime)
       callbacksRef.current.onTime?.(video.currentTime, finiteDuration(video))
-    }
-
-    const onProgress = () => {
-      if (cancelled) return
-      setBuffered(readBuffered(video))
     }
 
     const onPlay = () => {
@@ -340,7 +342,6 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
       hasPlayed = true
       lastAdvanceAt = Date.now()
       lastTime = video.currentTime
-      if (stableSince === null) stableSince = Date.now()
       endBufferEpisode()
       singleStallSignaled = false
       checkFirstFrame()
@@ -349,16 +350,16 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
 
     const onPause = () => {
       if (cancelled || video.ended) return
-      stableSince = null
       // A pause the user initiated must not inflate an in-flight stall duration.
       bufferEpisodeActive = false
       bufferCounted = false
+      setTime(video.currentTime)
+      setBuffered(readBuffered(video))
       updatePhase(video.readyState >= 2 ? 'paused' : 'loading')
     }
 
     const onWaiting = () => {
       if (!cancelled) {
-        stableSince = null
         noteBufferStart()
         updatePhase('buffering')
       }
@@ -369,7 +370,6 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
       hasPlayed = true
       lastAdvanceAt = Date.now()
       lastTime = video.currentTime
-      if (stableSince === null) stableSince = Date.now()
       endBufferEpisode()
       singleStallSignaled = false
       checkFirstFrame()
@@ -377,7 +377,6 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     }
 
     const onSeeking = () => {
-      stableSince = null
       lastAdvanceAt = Date.now()
       lastTime = video.currentTime
       lastKnownTime = video.currentTime
@@ -394,6 +393,8 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
       lastTime = video.currentTime
       lastKnownTime = video.currentTime
       pendingRestore = false
+      setTime(video.currentTime)
+      setBuffered(readBuffered(video))
       hasPlayed = true
     }
 
@@ -447,6 +448,7 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
       if (cancelled) return
       const total = finiteDuration(video)
       if (total > 0) setDuration(total)
+      setBuffered(readBuffered(video))
       updateResolution()
       checkFirstFrame()
       applyStartTime()
@@ -462,6 +464,7 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     const onEnded = () => {
       if (cancelled) return
       pendingPlay = false
+      setTime(video.currentTime)
       updatePhase('ended')
       callbacksRef.current.onEnded?.()
     }
@@ -497,7 +500,6 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
       ['loadeddata', onLoadedData],
       ['durationchange', onLoadedMetadata],
       ['timeupdate', onTimeUpdate],
-      ['progress', onProgress],
       ['play', onPlay],
       ['pause', onPause],
       ['waiting', onWaiting],
@@ -563,8 +565,6 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
         const instance = new Hls(HLS_CONFIG)
         hls = instance
         hlsRef.current = instance
-        stableSince = null
-        upgradedToTop = false
         instance.on(Hls.Events.MANIFEST_PARSED, () => {
           if (cancelled) return
           let cappedIndex = -1
@@ -572,6 +572,16 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
             if (level.height > 0 && level.height <= 1080) cappedIndex = index
           })
           topLevelIndex = cappedIndex >= 0 ? cappedIndex : 0
+          topLevelIndexRef.current = topLevelIndex
+          setLevels(
+            instance.levels
+              .map((level, index) => ({
+                index,
+                height: level.height || 0,
+                bitrate: level.bitrate || 0,
+              }))
+              .filter((level) => level.height > 0),
+          )
           try {
             // 1080P is the default ceiling; 4K is not auto-selected this round.
             instance.autoLevelCapping = topLevelIndex
@@ -731,6 +741,28 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     setProxyNonce((current) => current + 1)
   }, [])
 
+  const setLevel = useCallback((level: number | 'auto') => {
+    const instance = hlsRef.current
+    if (!instance) return
+    try {
+      if (level === 'auto') {
+        // 手动选级会关闭 ABR；回到自动时恢复 1080 上限并交还给 hls.js。
+        instance.autoLevelCapping = topLevelIndexRef.current
+        instance.currentLevel = -1
+        setSelectedLevel('auto')
+      } else {
+        const exists = instance.levels[level]
+        if (!exists) return
+        // 用户显式选择更高画质时解除默认 1080 上限。
+        instance.autoLevelCapping = -1
+        instance.currentLevel = level
+        setSelectedLevel(level)
+      }
+    } catch {
+      // ignore unsupported level switches
+    }
+  }, [])
+
   return {
     videoRef,
     phase,
@@ -738,6 +770,8 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     duration,
     buffered,
     quality,
+    levels,
+    selectedLevel,
     error,
     usingProxy,
     rate,
@@ -746,6 +780,7 @@ export function useHlsPlayer(options: UseHlsPlayerOptions): HlsPlayerController 
     toggle,
     seek,
     setRate,
+    setLevel,
     retry,
     retryOnProxy,
   }

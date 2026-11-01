@@ -257,7 +257,7 @@ export const subjectToTitle = (subject: DbSubject, kind: 'tv' | 'movie'): Title 
     titleStyle: 'condensed',
     titleLines: splitTitleLines(name),
     cardTitleSize: 'sm',
-    language: '中文',
+    language: '',
     creator: '',
     cast: [],
     isNew: subject.isNew,
@@ -286,7 +286,7 @@ export const suggestToTitle = (item: DbSuggest): Title => {
     titleStyle: 'condensed',
     titleLines: splitTitleLines(item.title),
     cardTitleSize: 'sm',
-    language: '中文',
+    language: '',
     creator: '',
     cast: [],
     addedOrder: 0,
@@ -298,14 +298,16 @@ export const fetchDoubanRecommend = (
   tags: string[],
   sort: ExploreSort,
   minRating: number,
+  start = 0,
+  count = 48,
 ) =>
   call<DbRecommend[]>('douban_recommend', {
     form,
     tags,
     sort,
     minRating,
-    start: 0,
-    count: 48,
+    start,
+    count,
   })
 
 const episodeCountFrom = (raw: string) => {
@@ -336,7 +338,7 @@ export const recommendToTitle = (item: DbRecommend): Title => {
     titleStyle: 'condensed',
     titleLines: splitTitleLines(item.title),
     cardTitleSize: 'sm',
-    language: '中文',
+    language: '',
     addedOrder: 0,
     isNew: false,
     episodesCount: episodeCountFrom(item.episodesInfo),
@@ -381,15 +383,48 @@ export const exploreRequests = (
   ]
 }
 
-export const fetchExploreTitles = async (view: ViewKey, values: ExploreValues) => {
+export interface ExplorePage {
+  items: Title[]
+  error: boolean
+  offsets: number[]
+  exhausted: boolean
+}
+
+export const fetchExploreTitles = async (
+  view: ViewKey,
+  values: ExploreValues,
+  offsets: number[] = [],
+  count = 48,
+): Promise<ExplorePage> => {
   const requests = exploreRequests(view, values)
-  if (requests.length === 0) return { items: [], error: false }
+  if (requests.length === 0) {
+    return { items: [], error: false, offsets: [], exhausted: true }
+  }
+  const starts = requests.map((_, index) => offsets[index] ?? 0)
   const results = await Promise.all(
-    requests.map((request) =>
-      fetchDoubanRecommend(request.endpoint, request.tags, values.sort, values.minRating),
+    requests.map((request, index) =>
+      fetchDoubanRecommend(
+        request.endpoint,
+        request.tags,
+        values.sort,
+        values.minRating,
+        starts[index],
+        count,
+      ),
     ),
   )
-  const buckets = results.map((items) => (items ?? []).map(recommendToTitle))
+  const nextOffsets = [...starts]
+  const exhaustedFlags: boolean[] = []
+  const buckets = results.map((items, index) => {
+    if (items === null) {
+      // 失败的分页保留原游标，下一次重试同一页，而不是跳过。
+      exhaustedFlags[index] = false
+      return []
+    }
+    nextOffsets[index] = starts[index] + items.length
+    exhaustedFlags[index] = items.length < count
+    return items.map(recommendToTitle)
+  })
   const seen = new Set<string>()
   const merged: Title[] = []
   const longest = buckets.reduce((max, bucket) => Math.max(max, bucket.length), 0)
@@ -401,7 +436,13 @@ export const fetchExploreTitles = async (view: ViewKey, values: ExploreValues) =
       merged.push(title)
     }
   }
-  return { items: merged, error: results.every((result) => result === null) }
+  const allFailed = results.every((result) => result === null)
+  return {
+    items: merged,
+    error: allFailed,
+    offsets: nextOffsets,
+    exhausted: !allFailed && exhaustedFlags.every(Boolean),
+  }
 }
 
 export const applyDetail = (base: Title, detail: DbDetail): Title => {

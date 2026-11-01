@@ -101,11 +101,13 @@ async function main() {
     const state = await page.evaluate(() => ({
       searchView: Boolean(document.querySelector('.search-view')),
       emptyState: Boolean(document.querySelector('.search-view .empty-state')),
-      crashed: Boolean(document.querySelector('[role="alert"]')),
+      // 搜索错误态也使用 role=alert，不能把它当成 ErrorBoundary 崩溃。
+      crashed: Boolean(document.querySelector('[role="alert"]')) &&
+        document.body.innerText.includes('页面遇到了一点问题'),
     }))
     record(
       'empty search shows empty state, not a blank screen',
-      state.searchView && (state.emptyState || !state.crashed) && !state.crashed,
+      state.searchView && state.emptyState && !state.crashed,
       JSON.stringify(state),
     )
     await page.fill('.search-input', '')
@@ -146,9 +148,23 @@ async function main() {
     await page.locator('.poster-card .card-action').first().click()
     await page.waitForSelector('.theater', { timeout: 30_000 })
     await page.waitForSelector('.rate-btn', { timeout: 15_000 })
+    // 视频 metadata 就绪后再测倍速；加载中点击会先被下一次 load 重置，属于测试竞态。
+    await page.waitForFunction(
+      () => {
+        const video = document.querySelector('.theater-video')
+        return video && video.readyState >= 2
+      },
+      null,
+      { timeout: 150_000 },
+    )
     const before = await page.evaluate(() => document.querySelector('.theater-video')?.playbackRate ?? 0)
     await page.locator('.rate-btn').click()
-    await sleep(800)
+    await page.waitForFunction(
+      (previous) => document.querySelector('.theater-video')?.playbackRate !== previous,
+      before,
+      { timeout: 15_000 },
+    ).catch(() => undefined)
+    await sleep(300)
     const after = await page.evaluate(() => ({
       rate: document.querySelector('.theater-video')?.playbackRate ?? 0,
       label: document.querySelector('.rate-btn')?.textContent ?? '',

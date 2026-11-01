@@ -26,6 +26,12 @@ const WARM_TIMEOUT: Duration = Duration::from_secs(3);
 const LIST_TTL: Duration = Duration::from_secs(600);
 const DETAIL_TTL: Duration = Duration::from_secs(86_400);
 static COOKIE_WARMED: AtomicBool = AtomicBool::new(false);
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+fn image_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(6))
+}
 
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -601,24 +607,37 @@ pub async fn douban_detail(id: String, kind: Option<String>) -> Result<DbDetail,
         "movie"
     };
     let secondary = if primary == "tv" { "movie" } else { "tv" };
-    let mut futures: Vec<BoxFuture<'static, Result<(String, DbDetail), String>>> = Vec::new();
-    for host in REXXAR_HOSTS {
-        for endpoint in [primary, secondary] {
+    let started = Instant::now();
+    let mut last_error = String::new();
+    // 先并发尝试两个 host 的主 endpoint（最常见情况 2 个请求即可），
+    // 只有主 endpoint 都失败时才回退到另一个 endpoint，避免每次详情 4 路请求。
+    for endpoint in [primary, secondary] {
+        let remaining = DETAIL_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut futures: Vec<BoxFuture<'static, Result<(String, DbDetail), String>>> = Vec::new();
+        for host in REXXAR_HOSTS {
             futures.push(Box::pin(fetch_detail_from(
                 host.to_string(),
                 endpoint.to_string(),
                 subject_id.clone(),
             )));
         }
-    }
-    match tokio::time::timeout(DETAIL_BUDGET, futures::future::select_ok(futures)).await {
-        Ok(Ok((body_and_detail, _remaining))) => {
-            let (body, detail) = body_and_detail;
-            cache_put(cache_key, body, DETAIL_TTL);
-            Ok(detail)
+        match tokio::time::timeout(remaining, futures::future::select_ok(futures)).await {
+            Ok(Ok((body_and_detail, _remaining))) => {
+                let (body, detail) = body_and_detail;
+                cache_put(cache_key, body, DETAIL_TTL);
+                return Ok(detail);
+            }
+            Ok(Err(error)) => last_error = error,
+            Err(_) => return Err("豆瓣详情请求超时（8s）".to_string()),
         }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err("豆瓣详情请求超时（8s）".to_string()),
+    }
+    if last_error.is_empty() {
+        Err("豆瓣详情请求超时（8s）".to_string())
+    } else {
+        Err(last_error)
     }
 }
 
@@ -767,6 +786,10 @@ pub async fn fetch_image(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     if !host_allowed {
         return image_error(400, "only doubanio.com images are allowed");
     }
+    let _permit = match image_semaphore().acquire().await {
+        Ok(permit) => permit,
+        Err(_) => return image_error(503, "image proxy busy"),
+    };
     let attempt = image_client()
         .get(parsed)
         .header(header::REFERER, IMG_REFERER)
@@ -774,7 +797,7 @@ pub async fn fetch_image(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
         .send()
         .await;
     match attempt {
-        Ok(response) => {
+        Ok(mut response) => {
             let status = response.status().as_u16();
             if status != 200 {
                 return image_error(502, "douban image upstream error");
@@ -784,20 +807,29 @@ pub async fn fetch_image(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
                 .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.to_string());
-            match response.bytes().await {
-                Ok(bytes) => {
-                    let mut builder = Response::builder()
-                        .status(200)
-                        .header(header::CACHE_CONTROL, "public, max-age=2592000");
-                    if let Some(content_type) = content_type {
-                        builder = builder.header(header::CONTENT_TYPE, content_type);
+            let mut bytes = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if bytes.len().saturating_add(chunk.len()) > MAX_IMAGE_BYTES {
+                            return image_error(502, "douban image too large");
+                        }
+                        bytes.extend_from_slice(&chunk);
                     }
-                    builder
-                        .body(bytes.to_vec())
-                        .expect("failed to build image response")
+                    Ok(None) => break,
+                    Err(_) => return image_error(502, "failed to read image body"),
                 }
-                Err(_) => image_error(502, "failed to read image body"),
             }
+            let mut builder = Response::builder()
+                .status(200)
+                .header(header::CACHE_CONTROL, "public, max-age=2592000")
+                .header(header::CONTENT_LENGTH, bytes.len().to_string());
+            if let Some(content_type) = content_type {
+                builder = builder.header(header::CONTENT_TYPE, content_type);
+            }
+            builder
+                .body(bytes)
+                .expect("failed to build image response")
         }
         Err(_) => image_error(502, "failed to fetch douban image"),
     }
