@@ -3,6 +3,7 @@
   <h1>SEEWORLD · 见界</h1>
   <p><strong>见世界，见边界。</strong><br />
   安静、私密的 Windows 私人影院</p>
+  <p><a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License" /></a></p>
 </div>
 
 ![SeeWorld 全流程演示：主页、无限瀑布流、搜索、详情、1080P 播放与设置](docs/assets/seeworld-flow.gif)
@@ -100,7 +101,11 @@ GitHub Actions 会在推送时构建 Windows 安装包并发布到 Releases：
 - 仅支持 Windows 10 / 11；首次启动依赖 WebView2 Runtime。
 - 本项目不提供、不存储、不分发任何影视内容。元数据来自豆瓣，播放地址由第三方公开接口提供，可用性取决于源站。
 - 广告过滤只作用于可识别的 HLS 广告分片；源站改版或更换广告形式时可能需要更新线路规则。
-- 代码仅供个人学习与技术研究，请支持正版。仓库暂未附带开源许可证。
+- 代码仅供个人学习与技术研究，请支持正版。
+
+## 许可证
+
+本项目以 [MIT 许可证](LICENSE) 开源，可自由使用、修改与再分发（含商业用途），保留版权与许可声明即可。软件按「原样」提供，不含任何担保；元数据与播放地址均来自第三方公开接口，其可用性不在承诺范围内。
 
 ## 致谢
 
